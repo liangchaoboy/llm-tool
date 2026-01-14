@@ -1,0 +1,46 @@
+# 敏感信息
+*.env
+*.env.local
+*.key
+*.pem
+*.p12
+*.pfx
+config/config.local.yaml
+config/config.prod.yaml
+
+# 编译产物
+*.exe
+*.dll
+*.so
+*.dylib
+llm-test-tool-v14*
+llm-test-tool-v14V3*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 测试报告（可能包含敏感信息）
+*-test-report-*.html
+*-test-report-*.json
+performance-test-report-*.html
+performance-test-report-*.json
+
+# 日志文件
+*.log
+logs/
+
+# 临时文件
+*.tmp
+*.bak
+*.corrupted
+
+# macOS
+.DS_Store
+
+# Go
+*.test
+*.out
