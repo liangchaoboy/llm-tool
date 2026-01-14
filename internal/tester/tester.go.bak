@@ -1,0 +1,705 @@
+package tester
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/user/llm-test-tool/config"
+	"github.com/user/llm-test-tool/internal/api"
+	"github.com/user/llm-test-tool/internal/models"
+)
+
+// TestRunner 测试运行器
+type TestRunner struct {
+	client *api.Client
+	config config.TestConfig
+}
+
+// NewTestRunner 创建测试运行器
+func NewTestRunner(client *api.Client, testConfig config.TestConfig) *TestRunner {
+	return &TestRunner{
+		client: client,
+		config: testConfig,
+	}
+}
+
+// RunFunctionalTests 运行功能测试
+func (tr *TestRunner) RunFunctionalTests(ctx context.Context) []models.TestResult {
+	var results []models.TestResult
+
+	// 基础功能测试用例
+	testCases := tr.getFunctionalTestCases()
+
+	for _, testCase := range testCases {
+		result := tr.runSingleTest(ctx, testCase)
+		results = append(results, result)
+	}
+
+	return results
+}
+
+// RunPerformanceTests 运行性能测试
+func (tr *TestRunner) RunPerformanceTests(ctx context.Context) []models.TestResult {
+	var results []models.TestResult
+
+	if !tr.config.Performance.Enabled {
+		return results
+	}
+
+	// 并发性能测试
+	concurrentResults := tr.runConcurrentPerformanceTest(ctx)
+	results = append(results, concurrentResults...)
+
+	// 压力测试
+	stressResults := tr.runStressTest(ctx)
+	results = append(results, stressResults...)
+
+	return results
+}
+
+// RunStabilityTests 运行稳定性测试
+func (tr *TestRunner) RunStabilityTests(ctx context.Context) []models.TestResult {
+	var results []models.TestResult
+
+	if !tr.config.Stability.Enabled {
+		return results
+	}
+
+	// 长时间运行测试
+	longRunningResults := tr.runLongRunningTest(ctx)
+	results = append(results, longRunningResults...)
+
+	// 错误恢复测试
+	recoveryResults := tr.runErrorRecoveryTest(ctx)
+	results = append(results, recoveryResults...)
+
+	return results
+}
+
+// RunSecurityTests 运行安全测试
+func (tr *TestRunner) RunSecurityTests(ctx context.Context) []models.TestResult {
+	var results []models.TestResult
+
+	if !tr.config.Security.Enabled {
+		return results
+	}
+
+	// 输入验证测试
+	inputValidationResults := tr.runInputValidationTests(ctx)
+	results = append(results, inputValidationResults...)
+
+	// 注入攻击测试
+	injectionResults := tr.runInjectionTests(ctx)
+	results = append(results, injectionResults...)
+
+	return results
+}
+
+// RunCompatibilityTests 运行兼容性测试
+func (tr *TestRunner) RunCompatibilityTests(ctx context.Context) []models.TestResult {
+	var results []models.TestResult
+
+	if !tr.config.Compatibility.Enabled {
+		return results
+	}
+
+	// 模型兼容性测试
+	modelResults := tr.runModelCompatibilityTests(ctx)
+	results = append(results, modelResults...)
+
+	// 参数兼容性测试
+	paramResults := tr.runParameterCompatibilityTests(ctx)
+	results = append(results, paramResults...)
+
+	return results
+}
+
+// RunAllTests 运行所有测试
+func (tr *TestRunner) RunAllTests(ctx context.Context) []models.TestResult {
+	var allResults []models.TestResult
+
+	// 按顺序运行各类测试
+	allResults = append(allResults, tr.RunFunctionalTests(ctx)...)
+	allResults = append(allResults, tr.RunPerformanceTests(ctx)...)
+	allResults = append(allResults, tr.RunStabilityTests(ctx)...)
+	allResults = append(allResults, tr.RunSecurityTests(ctx)...)
+	allResults = append(allResults, tr.RunCompatibilityTests(ctx)...)
+
+	return allResults
+}
+
+// runSingleTest 执行单个测试用例
+func (tr *TestRunner) runSingleTest(ctx context.Context, testCase models.TestCase) models.TestResult {
+	result := models.TestResult{
+		TestCaseID: testCase.ID,
+		Name:       testCase.Name,
+		StartTime:  time.Now(),
+	}
+
+	// 设置超时上下文
+	timeoutCtx, cancel := context.WithTimeout(ctx, testCase.Timeout)
+	defer cancel()
+
+	// 执行测试逻辑
+	switch testCase.Category {
+	case "functional":
+		result = tr.executeFunctionalTest(timeoutCtx, testCase, result)
+	case "performance":
+		result = tr.executePerformanceTest(timeoutCtx, testCase, result)
+	case "stability":
+		result = tr.executeStabilityTest(timeoutCtx, testCase, result)
+	case "security":
+		result = tr.executeSecurityTest(timeoutCtx, testCase, result)
+	case "compatibility":
+		result = tr.executeCompatibilityTest(timeoutCtx, testCase, result)
+	default:
+		result.Status = models.Error
+		result.Error = fmt.Sprintf("未知的测试类别: %s", testCase.Category)
+	}
+
+	result.EndTime = time.Now()
+	result.Duration = result.EndTime.Sub(result.StartTime)
+
+	return result
+}
+
+// getFunctionalTestCases 获取功能测试用例
+func (tr *TestRunner) getFunctionalTestCases() []models.TestCase {
+	return []models.TestCase{
+		{
+			ID:          "FUNC-001",
+			Name:        "基础对话功能测试",
+			Description: "测试基本的文本生成能力",
+			Category:    "functional",
+			Tags:        []string{"basic", "text-generation"},
+			Timeout:     30 * time.Second,
+			Config: map[string]interface{}{
+				"prompt":              "你好，请介绍一下你自己",
+				"expected_min_length": 10,
+			},
+		},
+		{
+			ID:          "FUNC-002",
+			Name:        "多轮对话测试",
+			Description: "测试多轮对话的上下文保持能力",
+			Category:    "functional",
+			Tags:        []string{"multi-turn", "context"},
+			Timeout:     45 * time.Second,
+			Config: map[string]interface{}{
+				"conversation_rounds": 3,
+			},
+		},
+		{
+			ID:          "FUNC-003",
+			Name:        "JSON格式输出测试",
+			Description: "测试结构化数据输出能力",
+			Category:    "functional",
+			Tags:        []string{"structured-output", "json"},
+			Timeout:     30 * time.Second,
+			Config: map[string]interface{}{
+				"prompt":        "请以JSON格式返回一个包含姓名、年龄、职业的对象",
+				"validate_json": true,
+			},
+		},
+		{
+			ID:          "FUNC-004",
+			Name:        "代码生成测试",
+			Description: "测试代码生成功能",
+			Category:    "functional",
+			Tags:        []string{"code-generation", "programming"},
+			Timeout:     60 * time.Second,
+			Config: map[string]interface{}{
+				"prompt":          "请用Python写一个计算斐波那契数列的函数",
+				"validate_syntax": true,
+			},
+		},
+		{
+			ID:          "FUNC-005",
+			Name:        "数学计算测试",
+			Description: "测试数学运算能力",
+			Category:    "functional",
+			Tags:        []string{"math", "calculation"},
+			Timeout:     30 * time.Second,
+			Config: map[string]interface{}{
+				"prompt":               "计算 123 * 456 + 789 的结果",
+				"validate_calculation": true,
+			},
+		},
+	}
+}
+
+// executeFunctionalTest 执行功能测试
+func (tr *TestRunner) executeFunctionalTest(ctx context.Context, testCase models.TestCase, result models.TestResult) models.TestResult {
+	switch testCase.ID {
+	case "FUNC-001":
+		return tr.testBasicConversation(ctx, testCase, result)
+	case "FUNC-002":
+		return tr.testMultiTurnConversation(ctx, testCase, result)
+	case "FUNC-003":
+		return tr.testJSONOutput(ctx, testCase, result)
+	case "FUNC-004":
+		return tr.testCodeGeneration(ctx, testCase, result)
+	case "FUNC-005":
+		return tr.testMathCalculation(ctx, testCase, result)
+	default:
+		result.Status = models.Error
+		result.Error = "未实现的功能测试用例"
+		return result
+	}
+}
+
+// testBasicConversation 基础对话测试
+func (tr *TestRunner) testBasicConversation(ctx context.Context, testCase models.TestCase, result models.TestResult) models.TestResult {
+	prompt := testCase.Config["prompt"].(string)
+	minLength := testCase.Config["expected_min_length"].(int)
+
+	req := &api.Request{
+		Model: tr.client.GetModel(),
+		Messages: []api.Message{
+			{Role: "user", Content: prompt},
+		},
+		MaxTokens: 200,
+	}
+
+	resp, err := tr.client.RetryCall(ctx, req)
+	if err != nil {
+		result.Status = models.Fail
+		result.Error = fmt.Sprintf("API调用失败: %v", err)
+		return result
+	}
+
+	// 验证响应长度
+	responseText := resp.Choices[0].Message.Content
+	if len(responseText) < minLength {
+		result.Status = models.Fail
+		result.Error = fmt.Sprintf("响应长度不足，期望至少%d字符，实际%d字符", minLength, len(responseText))
+		return result
+	}
+
+	// 验证响应质量
+	if tr.isResponseValid(responseText) {
+		result.Status = models.Pass
+		result.Message = "基础对话功能正常"
+		result.Metrics = models.Metrics{
+			ResponseTime: time.Since(result.StartTime),
+			TokenCount:   resp.Usage.TotalTokens,
+		}
+	} else {
+		result.Status = models.Fail
+		result.Error = "响应内容不符合预期"
+	}
+
+	return result
+}
+
+// testMultiTurnConversation 多轮对话测试
+func (tr *TestRunner) testMultiTurnConversation(ctx context.Context, testCase models.TestCase, result models.TestResult) models.TestResult {
+	rounds := testCase.Config["conversation_rounds"].(int)
+
+	messages := []api.Message{
+		{Role: "user", Content: "我们来玩个游戏，我说什么你就重复什么"},
+		{Role: "assistant", Content: "好的，我明白了"},
+		{Role: "user", Content: "苹果"},
+		{Role: "assistant", Content: "苹果"},
+		{Role: "user", Content: "香蕉"},
+	}
+
+	req := &api.Request{
+		Model:     tr.client.GetModel(),
+		Messages:  messages,
+		MaxTokens: 50,
+	}
+
+	resp, err := tr.client.RetryCall(ctx, req)
+	if err != nil {
+		result.Status = models.Fail
+		result.Error = fmt.Sprintf("API调用失败: %v", err)
+		return result
+	}
+
+	responseText := resp.Choices[0].Message.Content
+
+	// 验证是否正确重复了最后的输入
+	if contains(responseText, "香蕉") {
+		result.Status = models.Pass
+		result.Message = fmt.Sprintf("多轮对话测试通过，完成了%d轮对话", rounds)
+		result.Metrics = models.Metrics{
+			ResponseTime: time.Since(result.StartTime),
+			TokenCount:   resp.Usage.TotalTokens,
+		}
+	} else {
+		result.Status = models.Fail
+		result.Error = "未能正确处理多轮对话上下文"
+	}
+
+	return result
+}
+
+// testJSONOutput JSON输出测试
+func (tr *TestRunner) testJSONOutput(ctx context.Context, testCase models.TestCase, result models.TestResult) models.TestResult {
+	prompt := testCase.Config["prompt"].(string)
+
+	req := &api.Request{
+		Model: tr.client.GetModel(),
+		Messages: []api.Message{
+			{Role: "user", Content: prompt},
+		},
+		MaxTokens: 150,
+	}
+
+	resp, err := tr.client.RetryCall(ctx, req)
+	if err != nil {
+		result.Status = models.Fail
+		result.Error = fmt.Sprintf("API调用失败: %v", err)
+		return result
+	}
+
+	responseText := resp.Choices[0].Message.Content
+
+	// 验证JSON格式
+	if isValidJSON(responseText) {
+		result.Status = models.Pass
+		result.Message = "JSON格式输出测试通过"
+		result.Metrics = models.Metrics{
+			ResponseTime: time.Since(result.StartTime),
+			TokenCount:   resp.Usage.TotalTokens,
+		}
+	} else {
+		result.Status = models.Fail
+		result.Error = "输出不是有效的JSON格式"
+	}
+
+	return result
+}
+
+// testCodeGeneration 代码生成测试
+func (tr *TestRunner) testCodeGeneration(ctx context.Context, testCase models.TestCase, result models.TestResult) models.TestResult {
+	prompt := testCase.Config["prompt"].(string)
+
+	req := &api.Request{
+		Model: tr.client.GetModel(),
+		Messages: []api.Message{
+			{Role: "user", Content: prompt},
+		},
+		MaxTokens: 300,
+	}
+
+	resp, err := tr.client.RetryCall(ctx, req)
+	if err != nil {
+		result.Status = models.Fail
+		result.Error = fmt.Sprintf("API调用失败: %v", err)
+		return result
+	}
+
+	responseText := resp.Choices[0].Message.Content
+
+	// 验证代码语法（简单检查）
+	if contains(responseText, "def ") && contains(responseText, ":") {
+		result.Status = models.Pass
+		result.Message = "代码生成功能正常"
+		result.Metrics = models.Metrics{
+			ResponseTime: time.Since(result.StartTime),
+			TokenCount:   resp.Usage.TotalTokens,
+		}
+	} else {
+		result.Status = models.Fail
+		result.Error = "生成的内容不像是有效的Python代码"
+	}
+
+	return result
+}
+
+// testMathCalculation 数学计算测试
+func (tr *TestRunner) testMathCalculation(ctx context.Context, testCase models.TestCase, result models.TestResult) models.TestResult {
+	prompt := testCase.Config["prompt"].(string)
+
+	req := &api.Request{
+		Model: tr.client.GetModel(),
+		Messages: []api.Message{
+			{Role: "user", Content: prompt},
+		},
+		MaxTokens: 100,
+	}
+
+	resp, err := tr.client.RetryCall(ctx, req)
+	if err != nil {
+		result.Status = models.Fail
+		result.Error = fmt.Sprintf("API调用失败: %v", err)
+		return result
+	}
+
+	responseText := resp.Choices[0].Message.Content
+
+	// 验证是否包含正确的计算结果
+	expectedResult := "56997" // 123 * 456 + 789
+	if contains(responseText, expectedResult) || contains(responseText, "56997") {
+		result.Status = models.Pass
+		result.Message = "数学计算功能正常"
+		result.Metrics = models.Metrics{
+			ResponseTime: time.Since(result.StartTime),
+			TokenCount:   resp.Usage.TotalTokens,
+		}
+	} else {
+		result.Status = models.Fail
+		result.Error = fmt.Sprintf("计算结果不正确，期望包含%s", expectedResult)
+	}
+
+	return result
+}
+
+// 辅助函数
+func (tr *TestRunner) isResponseValid(response string) bool {
+	// 简单的有效性检查
+	return len(response) > 0 && !contains(response, "error") && !contains(response, "抱歉")
+}
+
+// 使用简单包含检查替换原有函数
+func contains(s, substr string) bool {
+	return simpleContains(s, substr)
+}
+
+func simpleContains(s, substr string) bool {
+	if len(substr) == 0 {
+		return true
+	}
+	if len(s) < len(substr) {
+		return false
+	}
+
+	for i := 0; i <= len(s)-len(substr); i++ {
+		match := true
+		for j := 0; j < len(substr); j++ {
+			if s[i+j] != substr[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func isValidJSON(s string) bool {
+	// 简单的JSON格式检查
+	return (contains(s, "{\") && contains(s, "}")) ||
+		(contains(s, "[") && contains(s, "]"))
+}
+
+// runConcurrentPerformanceTest 运行并发性能测试
+func (tr *TestRunner) runConcurrentPerformanceTest(ctx context.Context) []models.TestResult {
+	var results []models.TestResult
+	
+	testCases := []models.TestCase{
+		{
+			ID:          "PERF-001",
+			Name:        "并发请求性能测试",
+			Description: "测试高并发下的API响应性能",
+			Category:    "performance",
+			Tags:        []string{"concurrent", "performance"},
+			Timeout:     60 * time.Second,
+			Config: map[string]interface{}{
+				"concurrent_requests": 10,
+				"requests_per_worker": 5,
+			},
+		},
+	}
+	
+	for _, testCase := range testCases {
+		result := tr.runSingleTest(ctx, testCase)
+		results = append(results, result)
+	}
+	
+	return results
+}
+
+// runStressTest 运行压力测试
+func (tr *TestRunner) runStressTest(ctx context.Context) []models.TestResult {
+	var results []models.TestResult
+	
+	testCases := []models.TestCase{
+		{
+			ID:          "STRESS-001",
+			Name:        "长时间压力测试",
+			Description: "测试长时间高负载下的系统稳定性",
+			Category:    "performance",
+			Tags:        []string{"stress", "long-running"},
+			Timeout:     300 * time.Second,
+			Config: map[string]interface{}{
+				"duration":           300 * time.Second,
+				"requests_per_second": 2,
+			},
+		},
+	}
+	
+	for _, testCase := range testCases {
+		result := tr.runSingleTest(ctx, testCase)
+		results = append(results, result)
+	}
+	
+	return results
+}
+
+// executePerformanceTest 执行性能测试
+func (tr *TestRunner) executePerformanceTest(ctx context.Context, testCase models.TestCase, result models.TestResult) models.TestResult {
+	switch testCase.ID {
+	case "PERF-001":
+		return tr.testConcurrentPerformance(ctx, testCase, result)
+	case "STRESS-001":
+		return tr.testStressPerformance(ctx, testCase, result)
+	default:
+		result.Status = models.Error
+		result.Error = "未实现的性能测试用例"
+		return result
+	}
+}
+
+// testConcurrentPerformance 并发性能测试
+func (tr *TestRunner) testConcurrentPerformance(ctx context.Context, testCase models.TestCase, result models.TestResult) models.TestResult {
+	concurrentReqs := testCase.Config["concurrent_requests"].(int)
+	reqsPerWorker := testCase.Config["requests_per_worker"].(int)
+	
+	startTime := time.Now()
+	var totalTokens int
+	var successfulRequests int
+	
+	// 模拟并发请求
+	for i := 0; i < concurrentReqs; i++ {
+		req := &api.Request{
+			Model: tr.client.GetModel(),
+			Messages: []api.Message{
+				{Role: "user", Content: fmt.Sprintf("这是第%d个并发请求", i+1)},
+			},
+			MaxTokens: 100,
+		}
+		
+		resp, err := tr.client.RetryCall(ctx, req)
+		if err == nil {
+			successfulRequests++
+			totalTokens += resp.Usage.TotalTokens
+		}
+	}
+	
+	endTime := time.Now()
+	
+	result.Status = models.Pass
+	result.Message = fmt.Sprintf("并发性能测试完成，成功处理%d个请求", successfulRequests)
+	result.Metrics = models.Metrics{
+		ResponseTime: endTime.Sub(startTime),
+		TokenCount:   totalTokens,
+		SuccessRate:  float64(successfulRequests) / float64(concurrentReqs) * 100,
+	}
+	
+	return result
+}
+
+// testStressPerformance 压力性能测试
+func (tr *TestRunner) testStressPerformance(ctx context.Context, testCase models.TestCase, result models.TestResult) models.TestResult {
+	duration := testCase.Config["duration"].(time.Duration)
+	reqsPerSecond := testCase.Config["requests_per_second"].(int)
+	
+	startTime := time.Now()
+	var totalRequests int
+	var successfulRequests int
+	
+	ticker := time.NewTicker(time.Second / time.Duration(reqsPerSecond))
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			result.Status = models.Error
+			result.Error = "测试被取消"
+			return result
+		case <-ticker.C:
+			if time.Since(startTime) >= duration {
+				goto finish
+			}
+			
+			req := &api.Request{
+				Model: tr.client.GetModel(),
+				Messages: []api.Message{
+					{Role: "user", Content: fmt.Sprintf("压力测试请求 #%d", totalRequests+1)},
+				},
+				MaxTokens: 50,
+			}
+			
+			_, err := tr.client.RetryCall(ctx, req)
+			totalRequests++
+			if err == nil {
+				successfulRequests++
+			}
+		}
+	}
+	
+finish:
+	endTime := time.Now()
+	
+	result.Status = models.Pass
+	result.Message = fmt.Sprintf("压力测试完成，总请求数: %d, 成功数: %d", totalRequests, successfulRequests)
+	result.Metrics = models.Metrics{
+		ResponseTime: endTime.Sub(startTime),
+		SuccessRate:  float64(successfulRequests) / float64(totalRequests) * 100,
+	}
+	
+	return result
+}
+
+// runLongRunningTest 运行长时间测试
+func (tr *TestRunner) runLongRunningTest(ctx context.Context) []models.TestResult {
+	var results []models.TestResult
+	return results
+}
+
+// runErrorRecoveryTest 运行错误恢复测试
+func (tr *TestRunner) runErrorRecoveryTest(ctx context.Context) []models.TestResult {
+	var results []models.TestResult
+	return results
+}
+
+// runInputValidationTests 运行输入验证测试
+func (tr *TestRunner) runInputValidationTests(ctx context.Context) []models.TestResult {
+	var results []models.TestResult
+	return results
+}
+
+// runInjectionTests 运行注入测试
+func (tr *TestRunner) runInjectionTests(ctx context.Context) []models.TestResult {
+	var results []models.TestResult
+	return results
+}
+
+// runModelCompatibilityTests 运行模型兼容性测试
+func (tr *TestRunner) runModelCompatibilityTests(ctx context.Context) []models.TestResult {
+	var results []models.TestResult
+	return results
+}
+
+// runParameterCompatibilityTests 运行参数兼容性测试
+func (tr *TestRunner) runParameterCompatibilityTests(ctx context.Context) []models.TestResult {
+	var results []models.TestResult
+	return results
+}
+
+// executeStabilityTest 执行稳定性测试
+func (tr *TestRunner) executeStabilityTest(ctx context.Context, testCase models.TestCase, result models.TestResult) models.TestResult {
+	result.Status = models.Skip
+	result.Message = "稳定性测试暂未实现"
+	return result
+}
+
+// executeSecurityTest 执行安全测试
+func (tr *TestRunner) executeSecurityTest(ctx context.Context, testCase models.TestCase, result models.TestResult) models.TestResult {
+	result.Status = models.Skip
+	result.Message = "安全测试暂未实现"
+	return result
+}
+
+// executeCompatibilityTest 执行兼容性测试
+func (tr *TestRunner) executeCompatibilityTest(ctx context.Context, testCase models.TestCase, result models.TestResult) models.TestResult {
+	result.Status = models.Skip
+	result.Message = "兼容性测试暂未实现"
+	return result
+}

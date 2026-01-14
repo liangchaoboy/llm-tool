@@ -1,0 +1,68 @@
+api:
+  base_url: "https://api.openai.com/v1/chat/completions"  # 替换为实际的API端点
+  api_key: "your-api-key-here"  # 替换为实际的API密钥
+  model: "gpt-3.5-turbo"  # 替换为实际的模型名称
+  timeout: 30s
+  retry_count: 3
+  retry_delay: 1s
+  headers:
+    User-Agent: "LLM-Test-Tool/1.0"
+
+test:
+  functional:
+    enabled: true
+    timeout: 60s
+    test_cases_file: ""
+    max_retries: 3
+  
+  performance:
+    enabled: true
+    concurrency: 10
+    duration: 5m
+    warmup_time: 30s
+    requests: 1000
+    timeout: 30s
+    thresholds:
+      max_response_time: 5s
+      min_success_rate: 95.0
+      max_error_rate: 5.0
+      min_throughput: 10.0  # 每秒最小请求数
+  
+  stability:
+    enabled: true
+    duration: 1h
+    interval: 10s
+    max_errors: 10
+    check_health: true
+  
+  security:
+    enabled: true
+    test_sql_injection: true
+    test_xss: true
+    test_injection: true
+    blocked_inputs:
+      - "<script>"
+      - "DROP TABLE"
+      - "<?php"
+    allowed_inputs:
+      - "hello"
+      - "test"
+      - "sample"
+  
+  compatibility:
+    enabled: true
+    models:
+      - "gpt-3.5-turbo"
+      - "gpt-4"
+    formats:
+      - "text"
+      - "json"
+      - "code"
+    parameters:
+      - "temperature"
+      - "max_tokens"
+      - "top_p"
+    max_tokens:
+      - 100
+      - 200
+      - 500
