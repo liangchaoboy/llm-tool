@@ -1,12 +1,14 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/user/llm-test-tool/config"
@@ -115,6 +117,11 @@ func (c *Client) Call(ctx context.Context, req *Request) (*Response, error) {
 	}
 	defer resp.Body.Close()
 
+	// 如果是流式响应（SSE），按流式解析
+	if req.Stream || strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		return parseChatCompletionSSE(resp)
+	}
+
 	// 读取响应体
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -134,6 +141,97 @@ func (c *Client) Call(ctx context.Context, req *Request) (*Response, error) {
 	}
 
 	return &apiResp, nil
+}
+
+// parseChatCompletionSSE parses OpenAI-compatible chat.completions streaming responses (SSE).
+// It aggregates delta.content into a single assistant message. Usage fields may be absent.
+func parseChatCompletionSSE(resp *http.Response) (*Response, error) {
+	// 检查HTTP状态码
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API返回错误状态码 %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	type sseDelta struct {
+		Content string `json:"content,omitempty"`
+	}
+	type sseChoice struct {
+		Index        int      `json:"index"`
+		Delta        sseDelta `json:"delta"`
+		FinishReason string   `json:"finish_reason"`
+	}
+	type sseChunk struct {
+		ID      string      `json:"id"`
+		Object  string      `json:"object"`
+		Created int64       `json:"created"`
+		Model   string      `json:"model"`
+		Choices []sseChoice `json:"choices"`
+		Usage   Usage       `json:"usage"`
+	}
+
+	var out Response
+	out.Choices = []Choice{{Index: 0, Message: Message{Role: "assistant", Content: ""}}}
+
+	var b strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	// streaming chunks can be long; enlarge buffer
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		// SSE "data:" lines
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk sseChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			// ignore non-JSON frames
+			continue
+		}
+
+		if out.ID == "" && chunk.ID != "" {
+			out.ID = chunk.ID
+		}
+		if out.Object == "" && chunk.Object != "" {
+			out.Object = chunk.Object
+		}
+		if out.Model == "" && chunk.Model != "" {
+			out.Model = chunk.Model
+		}
+		if out.Created == 0 && chunk.Created != 0 {
+			out.Created = chunk.Created
+		}
+
+		// accumulate delta content
+		for _, c := range chunk.Choices {
+			if c.Delta.Content != "" {
+				b.WriteString(c.Delta.Content)
+			}
+			if c.FinishReason != "" {
+				out.Choices[0].FinishReason = c.FinishReason
+			}
+		}
+
+		// usage may appear in last chunk for some providers
+		if chunk.Usage.TotalTokens > 0 || chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
+			out.Usage = chunk.Usage
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("读取流式响应失败: %w", err)
+	}
+
+	out.Choices[0].Message.Content = b.String()
+	return &out, nil
 }
 
 // HealthCheck 健康检查

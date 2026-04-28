@@ -186,7 +186,7 @@ func main() {
 
 	// Verify token counts for a sample
 	fmt.Println("\nVerifying token counts for sample cases:")
-	for i, tc := range testCases[:5] {
+	for _, tc := range testCases[:5] {
 		actualTokens := estimateTokenCount(tc.Prompt)
 		difference := actualTokens - tc.InputTokens
 		status := "✓"
@@ -199,7 +199,7 @@ func main() {
 
 	// Show a sample of the content
 	fmt.Println("\nSample content preview:")
-	for i, tc := range testCases[:2] {
+	for _, tc := range testCases[:2] {
 		contentPreview := tc.Prompt
 		if len(contentPreview) > 200 {
 			contentPreview = contentPreview[:200] + "..."

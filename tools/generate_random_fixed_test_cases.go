@@ -157,7 +157,7 @@ func randomPrompt(r *rand.Rand, targetTokens int) string {
 func main() {
 	var (
 		outPath      = flag.String("out", "test-data/random-50k-1p5k.json", "输出用例文件路径")
-		count        = flag.Int("count", 20, "生成用例数量")
+		count        = flag.Int("count", 600, "生成用例数量")
 		inputTokens  = flag.Int("input-tokens", 50000, "每条用例输入tokens（按估算口径）")
 		outputTokens = flag.Int("output-tokens", 1500, "每条用例输出tokens（也用于max_tokens）")
 		seed         = flag.Int64("seed", 0, "随机种子（0表示用当前时间）")

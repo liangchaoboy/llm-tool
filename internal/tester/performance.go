@@ -277,6 +277,7 @@ func (pt *PerformanceTester) selectTestCase(requestIndex int) TestCase {
 func (pt *PerformanceTester) buildRequest(testCase TestCase) *api.Request {
 	req := &api.Request{
 		Model:       pt.config.Model,
+		Stream:      true,
 		MaxTokens:   testCase.MaxTokens,
 		Temperature: testCase.Temperature,
 	}
