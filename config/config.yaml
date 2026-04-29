@@ -1,9 +1,9 @@
 api:
   base_url: "https://api.openai.com/v1/chat/completions"  # 替换为实际的API端点
-  api_key: "your-api-key-here"  # 替换为实际的API密钥
-  model: "gpt-3.5-turbo"  # 替换为实际的模型名称
-  timeout: 30s
-  retry_count: 3
+  api_key: "your-api-key-here"  # 替换为实际的API密钥（真实 key 请写到 config/config.local.yaml）
+  model: "gpt-3.5-turbo"  # 占位值；实际 model 来自 test-case-file 中每条用例的 model 字段
+  timeout: 15m
+  retry_count: 0
   retry_delay: 1s
   headers:
     User-Agent: "LLM-Test-Tool/1.0"
