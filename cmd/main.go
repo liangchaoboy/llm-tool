@@ -25,6 +25,8 @@ func main() {
 	baseURL := flag.String("base-url", "https://api.openai.com/v1/chat/completions", "Base URL")
 	testCaseFile := flag.String("test-case-file", "test-data/test-cases.json", "测试用例文件路径")
 	outputFormat := flag.String("format", "html", "输出格式: json|html|markdown")
+	// -1 表示未指定（沿用 config.yaml / 回退默认值 0）
+	retryCount := flag.Int("retry-count", -1, "API 请求重试次数（基准测试建议 0；不传则沿用 config.yaml）")
 	flag.Parse()
 
 	fmt.Printf("开始LLM API性能测试\n")
@@ -65,9 +67,14 @@ func main() {
 			APIKey:     *apiKey,
 			Model:      *model,
 			Timeout:    120 * time.Second,
-			RetryCount: 3,
+			RetryCount: 0,
 			RetryDelay: 1 * time.Second,
 		}
+	}
+
+	// -retry-count 显式指定时覆盖 config/默认值
+	if *retryCount >= 0 {
+		apiConfig.RetryCount = *retryCount
 	}
 
 	// 创建API客户端
@@ -87,19 +94,24 @@ func main() {
 
 	// 输出性能指标
 	fmt.Printf("\n=== 性能测试结果 ===\n")
-	fmt.Printf("总请求数: %d\n", metrics.TotalRequests)
+	fmt.Printf("总请求数: %d  (成功: %d, 成功率: %.2f%%)\n",
+		metrics.TotalRequests, metrics.SuccessfulRequests, metrics.SuccessRate)
 	fmt.Printf("测试耗时: %v\n", testDuration)
-	fmt.Printf("平均响应时延: %v\n", metrics.AvgLatency)
-	fmt.Printf("平均每输出Token字数: %.2f\n", metrics.AvgOutputTokens)
-	fmt.Printf("RPS (每秒请求数): %.2f\n", metrics.RPS)
-	fmt.Printf("RPM (每分钟请求数): %.2f\n", metrics.RPM)
-	fmt.Printf("TPS (每秒总Token数): %.2f\n", metrics.TPS)
-	fmt.Printf("TPM (每分钟总Token数): %.2f\n", metrics.TPM)
-	fmt.Printf("Output TPS (每秒输出Token数): %.2f\n", metrics.OutputTPS)
-	fmt.Printf("Output TPM (每分钟输出Token数): %.2f\n", metrics.OutputTPM)
-	fmt.Printf("TTFT (平均首字节耗时): %v\n", metrics.TTFT)
-	fmt.Printf("TPOT (每输出Token时间): %v\n", metrics.TPOT)
-	fmt.Printf("平均生成速率 (输出Token/秒): %.2f\n", metrics.AvgGenerationRate)
+
+	fmt.Printf("\n-- 主指标：每请求平均 TPS --\n")
+	fmt.Printf("平均生成速率 (每请求输出Token/秒，对所有请求求平均): %.2f tokens/s\n",
+		metrics.AvgGenerationRate)
+
+	fmt.Printf("\n-- 单请求延迟 --\n")
+	fmt.Printf("TTFT (首Token耗时):          %v\n", metrics.TTFT)
+	fmt.Printf("TPOT (首Token后每Token时间): %v\n", metrics.TPOT)
+	fmt.Printf("平均完整时延:                %v\n", metrics.AvgLatency)
+	fmt.Printf("每个请求平均输出Token数:     %.2f\n", metrics.AvgOutputTokens)
+
+	fmt.Printf("\n-- 聚合吞吐（整体视角）--\n")
+	fmt.Printf("RPS: %.2f  RPM: %.2f\n", metrics.RPS, metrics.RPM)
+	fmt.Printf("Output TPS: %.2f  Output TPM: %.2f\n", metrics.OutputTPS, metrics.OutputTPM)
+	fmt.Printf("Total TPS (含Prompt): %.2f  Total TPM: %.2f\n", metrics.TPS, metrics.TPM)
 
 	// 生成测试报告
 	results := createPerformanceTestResults(metrics)

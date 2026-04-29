@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,7 +16,7 @@ import (
 type PerformanceTester struct {
 	client    *api.Client
 	config    PerformanceConfig
-	testCases []TestCase
+	testCases []json.RawMessage
 }
 
 // PerformanceConfig 性能测试配置
@@ -27,17 +27,6 @@ type PerformanceConfig struct {
 	APIKey            string `json:"api_key"`
 	BaseURL           string `json:"base_url"`
 	TestCaseFile      string `json:"test_case_file"`
-}
-
-// TestCase 测试用例结构
-type TestCase struct {
-	ID           string  `json:"id"`
-	Type         string  `json:"type"` // thinking or non_thinking
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
-	Prompt       string  `json:"prompt"`
-	Temperature  float64 `json:"temperature"`
-	MaxTokens    int     `json:"max_tokens"`
 }
 
 // PerformanceMetrics 性能指标
@@ -74,13 +63,26 @@ func NewPerformanceTester(client *api.Client, config PerformanceConfig) *Perform
 }
 
 // loadTestCases 加载测试用例
+//
+// 用例文件应为 JSON 数组，每个元素是"完整请求 body"，例如：
+//
+//	[
+//	  {
+//	    "stream": true,
+//	    "model": "moonshotai/kimi-k2.5",
+//	    "max_tokens": 1500,
+//	    "messages": [ {"role":"user", "content":[{"text":"hi","type":"text"}]} ]
+//	  }
+//	]
+//
+// 请求体会原样透传给 API，不做任何字段改写。
 func (pt *PerformanceTester) loadTestCases() error {
-	data, err := ioutil.ReadFile(pt.config.TestCaseFile)
+	data, err := os.ReadFile(pt.config.TestCaseFile)
 	if err != nil {
 		return fmt.Errorf("读取测试用例文件失败: %w", err)
 	}
 
-	var testCases []TestCase
+	var testCases []json.RawMessage
 	if err := json.Unmarshal(data, &testCases); err != nil {
 		return fmt.Errorf("解析测试用例文件失败: %w", err)
 	}
@@ -93,6 +95,11 @@ func (pt *PerformanceTester) loadTestCases() error {
 func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *PerformanceMetrics {
 	fmt.Printf("开始性能测试，使用并发数: %d，每并发请求数: %d\n",
 		pt.config.Concurrency, pt.config.RequestsPerWorker)
+
+	if cfg := pt.client.GetConfig(); cfg.RetryCount > 0 {
+		fmt.Printf("⚠️  当前 retry_count=%d；基准测试时重试会掩盖真实延迟与失败率，建议设置为 0。\n",
+			cfg.RetryCount)
+	}
 
 	// 记录测试开始时间
 	testStartTime := time.Now()
@@ -107,6 +114,7 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 	var totalOutputTokenCount int64
 	var totalGenerationRateSum float64 // 累计每个请求的生成速率（token/秒）
 	var generationRateMutex sync.Mutex // 保护totalGenerationRateSum的并发访问
+	var caseCursor int64               // 全局游标，确保多 worker 间均匀轮询所有用例
 
 	var wg sync.WaitGroup
 
@@ -117,19 +125,15 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 			defer wg.Done()
 
 			for j := 0; j < pt.config.RequestsPerWorker; j++ {
-				// 选择测试用例 (遵循 thinking:non-thinking = 1:4 的比例)
-				testCase := pt.selectTestCase(j)
+				// 用全局 atomic 游标轮询，避免多 worker 重复抽同一批用例
+				idx := atomic.AddInt64(&caseCursor, 1) - 1
+				reqBody := pt.selectTestCase(int(idx))
 
 				startTime := time.Now()
 
-				// 构建请求
-				req := pt.buildRequest(testCase)
-
-				// 记录TTFT (Time To First Byte - 平均首字节耗时)
-				// 注意：由于API是同步调用，这里实际测量的是整个API调用的耗时
-				ttftStart := time.Now()
-				resp, err := pt.client.RetryCall(ctx, req)
-				ttft := time.Since(ttftStart)
+				// TTFT 由 SSE 解析器在收到第一个含内容的 data 帧时打点返回，
+				// 这里拿到的是真正的 Time To First Token，而不是整个请求耗时。
+				resp, ttft, err := pt.client.RetryCallRawWithTTFT(ctx, reqBody, true)
 
 				requestLatency := time.Since(startTime)
 
@@ -150,10 +154,12 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 					outputTokens = len([]rune(contentStr))
 				}
 
-				// 计算TPOT (Time Per Output Token)
+				// TPOT (Time Per Output Token) = 首字节之后生成每个输出 token 的平均时间
+				// 公式：(总耗时 - TTFT) / (输出token数 - 1)
+				// 用 outputTokens-1 是因为 TTFT 已经覆盖了"第一个 token"的生成。
 				var tpot time.Duration
-				if outputTokens > 0 {
-					tpot = ttft / time.Duration(outputTokens)
+				if outputTokens > 1 && requestLatency > ttft {
+					tpot = (requestLatency - ttft) / time.Duration(outputTokens-1)
 				}
 
 				// 计算输入token数 - 优先使用API返回的真实token数
@@ -161,8 +167,8 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 				if resp.Usage.PromptTokens > 0 {
 					inputTokens = resp.Usage.PromptTokens
 				} else {
-					// 降级方案：使用字符数估算
-					inputTokens = len([]rune(testCase.Prompt))
+					// 降级方案：使用请求 body 字符数估算（粗略）
+					inputTokens = len([]rune(string(reqBody)))
 				}
 
 				// 计算该请求的生成速率（输出token数/该请求耗时）
@@ -246,87 +252,16 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 	return metrics
 }
 
-// selectTestCase 根据比例选择测试用例
-func (pt *PerformanceTester) selectTestCase(requestIndex int) TestCase {
-	// 实现 thinking:non-thinking = 1:4 的比例
-	// 每5个请求中，1个是thinking，4个是非thinking
-
-	// 统计thinking和non-thinking用例
-	var thinkingCases []TestCase
-	var nonThinkingCases []TestCase
-
-	for _, tc := range pt.testCases {
-		if tc.Type == "thinking" {
-			thinkingCases = append(thinkingCases, tc)
-		} else {
-			nonThinkingCases = append(nonThinkingCases, tc)
-		}
+// selectTestCase 按索引轮询选择一个请求 body（原样透传给 API）
+func (pt *PerformanceTester) selectTestCase(requestIndex int) json.RawMessage {
+	if len(pt.testCases) == 0 {
+		return nil
 	}
-
-	// 根据索引选择用例
-	if (requestIndex%5) == 0 && len(thinkingCases) > 0 {
-		// 选择thinking用例
-		return thinkingCases[(requestIndex/5)%len(thinkingCases)]
-	} else {
-		// 选择non-thinking用例
-		return nonThinkingCases[(requestIndex%len(nonThinkingCases))%len(nonThinkingCases)]
+	idx := requestIndex % len(pt.testCases)
+	if idx < 0 {
+		idx += len(pt.testCases)
 	}
-}
-
-// buildRequest 构建API请求，根据模型类型和测试用例类型自动处理thinking参数和消息格式
-func (pt *PerformanceTester) buildRequest(testCase TestCase) *api.Request {
-	req := &api.Request{
-		Model:       pt.config.Model,
-		Stream:      true,
-		MaxTokens:   testCase.MaxTokens,
-		Temperature: testCase.Temperature,
-	}
-
-	// 检查是否是deepseek思考模型
-	isDeepSeekThinkingModel := pt.isDeepSeekThinkingModel(pt.config.Model)
-	isThinkingCase := testCase.Type == "thinking"
-
-	// 如果是deepseek思考模型，使用新的消息格式和thinking参数
-	if isDeepSeekThinkingModel {
-		// 使用数组格式的消息
-		req.Messages = []api.Message{
-			{
-				Role: "user",
-				Content: api.ContentArray{
-					{
-						Text: testCase.Prompt,
-						Type: "text",
-					},
-				},
-			},
-		}
-
-		// 根据测试用例类型设置thinking参数
-		if isThinkingCase {
-			req.Thinking = &api.Thinking{Type: "enabled"}
-		} else {
-			req.Thinking = &api.Thinking{Type: "disabled"}
-		}
-	} else {
-		// 使用传统的字符串格式消息
-		req.Messages = []api.Message{
-			{
-				Role:    "user",
-				Content: testCase.Prompt,
-			},
-		}
-	}
-
-	return req
-}
-
-// isDeepSeekThinkingModel 检查是否是deepseek思考模型
-func (pt *PerformanceTester) isDeepSeekThinkingModel(model string) bool {
-	// 检查模型名称是否包含 deepseek-v3.2 或 deepseek/deepseek-v3.2
-	return model == "deepseek/deepseek-v3.2-251201" || 
-		   model == "deepseek-v3.2-251201" ||
-		   (len(model) > 8 && model[:9] == "deepseek/") ||
-		   (len(model) > 7 && model[:8] == "deepseek")
+	return pt.testCases[idx]
 }
 
 // extractContentString 从Message.Content中提取字符串内容

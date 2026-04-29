@@ -2,7 +2,7 @@ package config
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"time"
 
 	"gopkg.in/yaml.v2"
@@ -91,7 +91,7 @@ type Thresholds struct {
 
 // Load 加载配置文件
 func Load(filename string) (*Config, error) {
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件失败: %w", err)
 	}
@@ -114,8 +114,10 @@ func setDefaults(config *Config) {
 	if config.API.Timeout == 0 {
 		config.API.Timeout = 30 * time.Second
 	}
-	if config.API.RetryCount == 0 {
-		config.API.RetryCount = 3
+	// 注意：不把 RetryCount==0 当作"未设置"并替换为 3；
+	// 基准测试常常希望显式关闭重试，0 必须被保留为合法值。
+	if config.API.RetryCount < 0 {
+		config.API.RetryCount = 0
 	}
 	if config.API.RetryDelay == 0 {
 		config.API.RetryDelay = 1 * time.Second

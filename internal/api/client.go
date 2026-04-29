@@ -119,7 +119,8 @@ func (c *Client) Call(ctx context.Context, req *Request) (*Response, error) {
 
 	// 如果是流式响应（SSE），按流式解析
 	if req.Stream || strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-		return parseChatCompletionSSE(resp)
+		r, _, err := parseChatCompletionSSE(resp, time.Now())
+		return r, err
 	}
 
 	// 读取响应体
@@ -145,11 +146,15 @@ func (c *Client) Call(ctx context.Context, req *Request) (*Response, error) {
 
 // parseChatCompletionSSE parses OpenAI-compatible chat.completions streaming responses (SSE).
 // It aggregates delta.content into a single assistant message. Usage fields may be absent.
-func parseChatCompletionSSE(resp *http.Response) (*Response, error) {
+//
+// sendStart is the timestamp at which the HTTP request was dispatched; the
+// returned duration is the real TTFT — time from request send until the first
+// SSE frame carrying generated content arrives.
+func parseChatCompletionSSE(resp *http.Response, sendStart time.Time) (*Response, time.Duration, error) {
 	// 检查HTTP状态码
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API返回错误状态码 %d: %s", resp.StatusCode, string(respBody))
+		return nil, 0, fmt.Errorf("API返回错误状态码 %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	type sseDelta struct {
@@ -173,6 +178,8 @@ func parseChatCompletionSSE(resp *http.Response) (*Response, error) {
 	out.Choices = []Choice{{Index: 0, Message: Message{Role: "assistant", Content: ""}}}
 
 	var b strings.Builder
+	var ttft time.Duration
+	firstByteSeen := false
 	scanner := bufio.NewScanner(resp.Body)
 	// streaming chunks can be long; enlarge buffer
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -195,6 +202,17 @@ func parseChatCompletionSSE(resp *http.Response) (*Response, error) {
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			// ignore non-JSON frames
 			continue
+		}
+
+		// 在第一个包含生成内容的 delta 到达时打点，跳过空的/role-only 前导帧
+		if !firstByteSeen {
+			for _, c := range chunk.Choices {
+				if c.Delta.Content != "" {
+					ttft = time.Since(sendStart)
+					firstByteSeen = true
+					break
+				}
+			}
 		}
 
 		if out.ID == "" && chunk.ID != "" {
@@ -227,11 +245,93 @@ func parseChatCompletionSSE(resp *http.Response) (*Response, error) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("读取流式响应失败: %w", err)
+		return nil, 0, fmt.Errorf("读取流式响应失败: %w", err)
+	}
+
+	if !firstByteSeen {
+		// 整个响应都没见到 content 帧，退化为总耗时，避免 TTFT=0
+		ttft = time.Since(sendStart)
 	}
 
 	out.Choices[0].Message.Content = b.String()
-	return &out, nil
+	return &out, ttft, nil
+}
+
+// CallRaw sends the given JSON body as-is. Used when test cases already contain
+// the full request payload (model/messages/stream/etc).
+func (c *Client) CallRaw(ctx context.Context, body []byte, streamHint bool) (*Response, error) {
+	resp, _, err := c.CallRawWithTTFT(ctx, body, streamHint)
+	return resp, err
+}
+
+// CallRawWithTTFT sends the given JSON body as-is and returns the measured TTFT.
+// For SSE responses, TTFT is the time from request send until the first content frame.
+// For non-streaming responses, TTFT coincides with reading the response body.
+func (c *Client) CallRawWithTTFT(ctx context.Context, body []byte, streamHint bool) (*Response, time.Duration, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.config.BaseURL, bytes.NewBuffer(body))
+	if err != nil {
+		return nil, 0, fmt.Errorf("创建HTTP请求失败: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+	for key, value := range c.config.Headers {
+		httpReq.Header.Set(key, value)
+	}
+
+	sendStart := time.Now()
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, 0, fmt.Errorf("发送请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if streamHint || strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		return parseChatCompletionSSE(resp, sendStart)
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	ttft := time.Since(sendStart)
+	if err != nil {
+		return nil, 0, fmt.Errorf("读取响应体失败: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, 0, fmt.Errorf("API返回错误状态码 %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var apiResp Response
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return nil, 0, fmt.Errorf("解析响应失败: %w", err)
+	}
+	return &apiResp, ttft, nil
+}
+
+// RetryCallRaw retries CallRaw with the client's retry policy.
+func (c *Client) RetryCallRaw(ctx context.Context, body []byte, streamHint bool) (*Response, error) {
+	resp, _, err := c.RetryCallRawWithTTFT(ctx, body, streamHint)
+	return resp, err
+}
+
+// RetryCallRawWithTTFT retries CallRawWithTTFT. The returned TTFT reflects only
+// the winning attempt — for benchmark accuracy prefer RetryCount=0 so retries
+// don't mask real slowness.
+func (c *Client) RetryCallRawWithTTFT(ctx context.Context, body []byte, streamHint bool) (*Response, time.Duration, error) {
+	var lastErr error
+	for i := 0; i <= c.config.RetryCount; i++ {
+		resp, ttft, err := c.CallRawWithTTFT(ctx, body, streamHint)
+		if err == nil {
+			return resp, ttft, nil
+		}
+		lastErr = err
+		if i < c.config.RetryCount {
+			select {
+			case <-ctx.Done():
+				return nil, 0, ctx.Err()
+			case <-time.After(c.config.RetryDelay):
+			}
+		}
+	}
+	return nil, 0, fmt.Errorf("重试%d次后仍然失败: %w", c.config.RetryCount, lastErr)
 }
 
 // HealthCheck 健康检查

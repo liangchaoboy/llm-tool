@@ -15,6 +15,7 @@ config/config.prod.yaml
 *.dylib
 llm-test-tool-v14*
 llm-test-tool-v14V3*
+bin/
 
 # IDE
 .idea/
