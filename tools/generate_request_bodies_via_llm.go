@@ -270,6 +270,34 @@ func buildRandomLongTextViaLLM(ctx context.Context, httpClient *http.Client, gen
 	return b.String(), nil
 }
 
+func writeCasesJSONAtomic(path string, cases []requestBody) error {
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+
+	tmp, err := os.CreateTemp(dir, "cases-*.json.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+
+	enc := json.NewEncoder(tmp)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(cases); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
 func main() {
 	var (
 		outPath          = flag.String("out", "sample.json", "输出案例文件路径（JSON数组）")
@@ -283,7 +311,10 @@ func main() {
 		genBaseURL       = flag.String("gen-base-url", "https://api.qnaigc.com/v1/chat/completions", "生成用大模型的 baseUrl（chat completions）")
 		genAPIKey        = flag.String("gen-api-key", "", "生成用大模型的 apiKey（Bearer）")
 		genModel         = flag.String("gen-model", "", "生成用大模型的 model id（必填）")
-		genTimeoutSec    = flag.Int("gen-timeout-sec", 600, "生成用大模型单次请求超时（秒）")
+		// http.Client.Timeout applies to the entire request, including reading the response body.
+		// Streaming long outputs can exceed fixed timeouts; defaults are 900s (15m). Use 0 for unlimited.
+		genHTTPTimeoutSec = flag.Int("gen-http-timeout-sec", 900, "HTTP客户端全局超时（秒）。默认900(15m)。0表示不限制。stream长响应可改为0或更大")
+		genCallTimeoutSec = flag.Int("gen-call-timeout-sec", 900, "单次生成调用超时（秒）。默认900(15m)。0表示不限制")
 		genPerCallMaxTok = flag.Int("gen-per-call-max-tokens", 8000, "生成用大模型每次调用的 max_tokens（会分段拼到50k）")
 		seed             = flag.Int64("seed", 0, "随机种子（0表示用当前时间）")
 	)
@@ -312,7 +343,22 @@ func main() {
 		actualSeed = time.Now().UnixNano()
 	}
 
-	httpClient := &http.Client{Timeout: time.Duration(*genTimeoutSec) * time.Second}
+	httpTransport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		// reasonable defaults; avoid idle timeouts killing long streams unexpectedly
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+
+	httpClient := &http.Client{
+		Transport: httpTransport,
+	}
+	if *genHTTPTimeoutSec > 0 {
+		httpClient.Timeout = time.Duration(*genHTTPTimeoutSec) * time.Second
+	}
+
 	ctx := context.Background()
 
 	results := make([]requestBody, *count)
@@ -323,7 +369,17 @@ func main() {
 	worker := func() {
 		for idx := range jobs {
 			caseSeed := actualSeed + int64(idx)*1000003
-			text, err := buildRandomLongTextViaLLM(ctx, httpClient, *genBaseURL, *genAPIKey, *genModel, *targetInputTokens, *genPerCallMaxTok, *targetInputTokens, caseSeed)
+
+			callCtx := ctx
+			var cancel context.CancelFunc
+			if *genCallTimeoutSec > 0 {
+				callCtx, cancel = context.WithTimeout(ctx, time.Duration(*genCallTimeoutSec)*time.Second)
+			}
+
+			text, err := buildRandomLongTextViaLLM(callCtx, httpClient, *genBaseURL, *genAPIKey, *genModel, *targetInputTokens, *genPerCallMaxTok, *targetInputTokens, caseSeed)
+			if cancel != nil {
+				cancel()
+			}
 			if err != nil {
 				select {
 				case errCh <- fmt.Errorf("generate case %d failed: %w", idx+1, err):
@@ -349,6 +405,17 @@ func main() {
 			est := estimateTokenCount(text)
 			printMu.Lock()
 			fmt.Printf("case %d/%d generated: estimated_input_tokens=%d target=%d diff=%d\n", idx+1, *count, est, *targetInputTokens, est-*targetInputTokens)
+
+			prefix := make([]requestBody, idx+1)
+			copy(prefix, results[:idx+1])
+			if err := writeCasesJSONAtomic(*outPath, prefix); err != nil {
+				select {
+				case errCh <- fmt.Errorf("write partial output failed after case %d: %w", idx+1, err):
+				default:
+				}
+				printMu.Unlock()
+				return
+			}
 			printMu.Unlock()
 		}
 	}
@@ -383,25 +450,12 @@ func main() {
 	select {
 	case err := <-errCh:
 		fmt.Println(err.Error())
+		fmt.Printf("hint: stream long generations may exceed timeouts; increase -gen-http-timeout-sec / -gen-call-timeout-sec, or set them to 0 (unlimited)\n")
 		os.Exit(1)
 	default:
 	}
 
-	if err := os.MkdirAll(filepath.Dir(*outPath), 0o755); err != nil && filepath.Dir(*outPath) != "." {
-		fmt.Printf("mkdir failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	f, err := os.Create(*outPath)
-	if err != nil {
-		fmt.Printf("create output failed: %v\n", err)
-		os.Exit(1)
-	}
-	defer f.Close()
-
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(results); err != nil {
+	if err := writeCasesJSONAtomic(*outPath, results); err != nil {
 		fmt.Printf("write output failed: %v\n", err)
 		os.Exit(1)
 	}
