@@ -17,6 +17,10 @@ llm-test-tool-v14*
 llm-test-tool-v14V3*
 bin/
 
+# 大语料/生成样本（避免超过 GitHub 100MB 限制）
+tools/tools/
+tools/corpus/
+
 # IDE
 .idea/
 .vscode/
