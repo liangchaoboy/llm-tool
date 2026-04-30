@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -75,10 +76,34 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
-// NewClient 创建新的API客户端
-func NewClient(apiConfig config.APIConfig) *Client {
+// NewClient 创建新的 API 客户端。
+//
+// maxConns 是「预期并发上限」。基准测试中通常 = worker 并发数；
+// 传 0 会退化为 net/http 默认（DefaultMaxIdleConnsPerHost=2），
+// 在高并发压测下会频繁重建 TCP/TLS，显著污染 TTFT 与延迟指标。
+func NewClient(apiConfig config.APIConfig, maxConns int) *Client {
+	if maxConns <= 0 {
+		maxConns = 2
+	}
+
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          maxConns * 2,
+		MaxIdleConnsPerHost:   maxConns,
+		MaxConnsPerHost:       maxConns,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	client := &http.Client{
-		Timeout: apiConfig.Timeout,
+		Timeout:   apiConfig.Timeout,
+		Transport: transport,
 	}
 
 	return &Client{
@@ -157,8 +182,15 @@ func parseChatCompletionSSE(resp *http.Response, sendStart time.Time) (*Response
 		return nil, 0, fmt.Errorf("API返回错误状态码 %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	// sseDelta 同时识别常见的「思考/推理」字段；对于带推理能力的模型
+	// （DeepSeek reasoning_content、Moonshot reasoning、Anthropic thinking 等），
+	// TTFT 应该是模型产生的第一个 token（无论是推理 token 还是回答 token），
+	// 否则 TTFT 会被推理阶段的耗时系统性高估。
 	type sseDelta struct {
-		Content string `json:"content,omitempty"`
+		Content          string `json:"content,omitempty"`
+		ReasoningContent string `json:"reasoning_content,omitempty"`
+		Reasoning        string `json:"reasoning,omitempty"`
+		Thinking         string `json:"thinking,omitempty"`
 	}
 	type sseChoice struct {
 		Index        int      `json:"index"`
@@ -180,6 +212,12 @@ func parseChatCompletionSSE(resp *http.Response, sendStart time.Time) (*Response
 	var b strings.Builder
 	var ttft time.Duration
 	firstByteSeen := false
+	// 用于识别"流是否正常结束"：三者任一为 true 即算正常收尾。
+	// 都是 false 说明上游把连接切了（TCP 提前 EOF），数据可能不完整。
+	gotDone := false
+	gotFinishReason := false
+	gotUsage := false
+
 	scanner := bufio.NewScanner(resp.Body)
 	// streaming chunks can be long; enlarge buffer
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -195,6 +233,7 @@ func parseChatCompletionSSE(resp *http.Response, sendStart time.Time) (*Response
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
+			gotDone = true
 			break
 		}
 
@@ -204,10 +243,13 @@ func parseChatCompletionSSE(resp *http.Response, sendStart time.Time) (*Response
 			continue
 		}
 
-		// 在第一个包含生成内容的 delta 到达时打点，跳过空的/role-only 前导帧
+		// 在第一个包含生成内容的 delta 到达时打点，跳过空的/role-only 前导帧。
+		// 这里把 reasoning/thinking 流也视为「首 token」，因为这些确实是模型产生的 token，
+		// 代表了 prefill 阶段完成。
 		if !firstByteSeen {
 			for _, c := range chunk.Choices {
-				if c.Delta.Content != "" {
+				d := c.Delta
+				if d.Content != "" || d.ReasoningContent != "" || d.Reasoning != "" || d.Thinking != "" {
 					ttft = time.Since(sendStart)
 					firstByteSeen = true
 					break
@@ -235,12 +277,14 @@ func parseChatCompletionSSE(resp *http.Response, sendStart time.Time) (*Response
 			}
 			if c.FinishReason != "" {
 				out.Choices[0].FinishReason = c.FinishReason
+				gotFinishReason = true
 			}
 		}
 
 		// usage may appear in last chunk for some providers
 		if chunk.Usage.TotalTokens > 0 || chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
 			out.Usage = chunk.Usage
+			gotUsage = true
 		}
 	}
 
@@ -248,10 +292,14 @@ func parseChatCompletionSSE(resp *http.Response, sendStart time.Time) (*Response
 		return nil, 0, fmt.Errorf("读取流式响应失败: %w", err)
 	}
 
-	if !firstByteSeen {
-		// 整个响应都没见到 content 帧，退化为总耗时，避免 TTFT=0
-		ttft = time.Since(sendStart)
+	// 识别上游提前断连：既没有 [DONE]、也没有 finish_reason、也没有 usage 的流视为失败。
+	// 不这样判的话，被截断的响应会被静默计为成功，污染延迟 / token / 成功率指标。
+	if !gotDone && !gotFinishReason && !gotUsage {
+		return nil, 0, fmt.Errorf("流式响应提前结束：未收到 [DONE]/finish_reason/usage 任一收尾信号，可能被上游截断")
 	}
+
+	// 如果整个响应都没见到 content 帧：保持 ttft=0，由调用方识别为"无 TTFT"并从均值中剔除。
+	// （不再退化为总耗时——把总耗时当 TTFT 会系统性污染 TTFT 均值。）
 
 	out.Choices[0].Message.Content = b.String()
 	return &out, ttft, nil

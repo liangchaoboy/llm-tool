@@ -18,67 +18,91 @@ import (
 func main() {
 	// 命令行参数解析
 	configFile := flag.String("config", "config/config.yaml", "配置文件路径")
-	concurrency := flag.Int("concurrency", 100, "并发数")
-	requestsPerWorker := flag.Int("requests-per-worker", 500, "每个并发的请求数")
-	model := flag.String("model", "gpt-3.5-turbo", "模型名称")
-	apiKey := flag.String("api-key", "", "API密钥")
-	baseURL := flag.String("base-url", "https://api.openai.com/v1/chat/completions", "Base URL")
-	testCaseFile := flag.String("test-case-file", "test-data/test-cases.json", "测试用例文件路径")
+	concurrency := flag.Int("concurrency", 0, "并发数（不传则取 config.yaml 的 test.performance.concurrency）")
+	requestsPerWorker := flag.Int("requests-per-worker", 0, "每个并发的请求数（不传则取 config.yaml 的 test.performance.requests_per_worker）")
+	model := flag.String("model", "", "模型名称（不传则取 config.yaml 的 api.model）")
+	apiKey := flag.String("api-key", "", "API密钥（不传则取 config.yaml 的 api.api_key）")
+	baseURL := flag.String("base-url", "", "Base URL（不传则取 config.yaml 的 api.base_url）")
+	testCaseFile := flag.String("test-case-file", "", "测试用例文件路径（JSON 数组，每条元素为完整的 chat.completions 请求体；不传则取 config.yaml 的 test.performance.test_case_file）")
 	outputFormat := flag.String("format", "html", "输出格式: json|html|markdown")
 	// -1 表示未指定（沿用 config.yaml / 回退默认值 0）
 	retryCount := flag.Int("retry-count", -1, "API 请求重试次数（基准测试建议 0；不传则沿用 config.yaml）")
 	flag.Parse()
 
-	fmt.Printf("开始LLM API性能测试\n")
-	fmt.Printf("并发数: %d, 每并发请求数: %d, 总请求数: %d\n",
-		*concurrency, *requestsPerWorker, *concurrency**requestsPerWorker)
+	// 记录用户显式设置过的 flag，避免 "CLI 默认值恰好等于用户想要的值" 时被 YAML 静默覆盖
+	setFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 
-	// 创建性能测试配置
-	perfConfig := tester.PerformanceConfig{
-		Concurrency:       *concurrency,
-		RequestsPerWorker: *requestsPerWorker,
-		Model:             *model,
-		APIKey:            *apiKey,
-		BaseURL:           *baseURL,
-		TestCaseFile:      *testCaseFile,
-	}
-
-	// 如果提供了配置文件，尝试从中加载API信息
-	var apiConfig config.APIConfig
+	// 加载配置文件（不存在则用空 Config 走默认值）
+	var cfg *config.Config
 	if _, err := os.Stat(*configFile); err == nil {
-		cfg, err := config.Load(*configFile)
-		if err == nil {
-			apiConfig = cfg.API
-			// 如果命令行参数未指定，则使用配置文件中的值
-			if *apiKey == "" {
-				apiConfig.APIKey = cfg.API.APIKey
-			}
-			if *model == "gpt-3.5-turbo" && cfg.API.Model != "" {
-				apiConfig.Model = cfg.API.Model
-			}
-			if *baseURL == "https://api.openai.com/v1/chat/completions" && cfg.API.BaseURL != "" {
-				apiConfig.BaseURL = cfg.API.BaseURL
-			}
+		loaded, err := config.Load(*configFile)
+		if err != nil {
+			log.Fatalf("加载配置文件失败: %v", err)
 		}
+		cfg = loaded
 	} else {
-		// 如果配置文件不存在，使用命令行参数创建API配置
-		apiConfig = config.APIConfig{
-			BaseURL:    *baseURL,
-			APIKey:     *apiKey,
-			Model:      *model,
-			Timeout:    120 * time.Second,
-			RetryCount: 0,
-			RetryDelay: 1 * time.Second,
-		}
+		cfg = &config.Config{}
 	}
 
-	// -retry-count 显式指定时覆盖 config/默认值
-	if *retryCount >= 0 {
+	// 合并 API 配置：CLI 显式指定 > YAML > 内置回退
+	apiConfig := cfg.API
+	if setFlags["api-key"] {
+		apiConfig.APIKey = *apiKey
+	}
+	if setFlags["model"] {
+		apiConfig.Model = *model
+	}
+	if setFlags["base-url"] {
+		apiConfig.BaseURL = *baseURL
+	}
+	if setFlags["retry-count"] && *retryCount >= 0 {
 		apiConfig.RetryCount = *retryCount
 	}
+	if apiConfig.Timeout == 0 {
+		// 配置文件不存在时 Load 未被调用，setDefaults 不生效，这里兜底一次
+		apiConfig.Timeout = 10 * time.Minute
+	}
+	if apiConfig.RetryDelay == 0 {
+		apiConfig.RetryDelay = 1 * time.Second
+	}
 
-	// 创建API客户端
-	client := api.NewClient(apiConfig)
+	// 合并性能测试配置：CLI 显式指定 > YAML > 兜底
+	perfConfig := tester.PerformanceConfig{
+		Concurrency:       cfg.Test.Performance.Concurrency,
+		RequestsPerWorker: cfg.Test.Performance.RequestsPerWorker,
+		TestCaseFile:      cfg.Test.Performance.TestCaseFile,
+		Model:             apiConfig.Model,
+		APIKey:            apiConfig.APIKey,
+		BaseURL:           apiConfig.BaseURL,
+	}
+	if setFlags["concurrency"] {
+		perfConfig.Concurrency = *concurrency
+	}
+	if setFlags["requests-per-worker"] {
+		perfConfig.RequestsPerWorker = *requestsPerWorker
+	}
+	if setFlags["test-case-file"] {
+		perfConfig.TestCaseFile = *testCaseFile
+	}
+	if perfConfig.Concurrency <= 0 {
+		perfConfig.Concurrency = 10
+	}
+	if perfConfig.RequestsPerWorker <= 0 {
+		perfConfig.RequestsPerWorker = 100
+	}
+	if perfConfig.TestCaseFile == "" {
+		fmt.Fprintln(os.Stderr, "错误：未指定测试用例文件。请通过 -test-case-file 或 config.yaml 的 test.performance.test_case_file 提供。")
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	fmt.Printf("开始LLM API性能测试\n")
+	fmt.Printf("并发数: %d, 每并发请求数: %d, 总请求数: %d\n",
+		perfConfig.Concurrency, perfConfig.RequestsPerWorker, perfConfig.Concurrency*perfConfig.RequestsPerWorker)
+
+	// 创建API客户端：连接池上限与并发数对齐，避免大量短连接重建 TLS
+	client := api.NewClient(apiConfig, perfConfig.Concurrency)
 
 	// 创建性能测试器
 	perfTester := tester.NewPerformanceTester(client, perfConfig)
@@ -114,7 +138,7 @@ func main() {
 	fmt.Printf("Total TPS (含Prompt): %.2f  Total TPM: %.2f\n", metrics.TPS, metrics.TPM)
 
 	// 生成测试报告
-	results := createPerformanceTestResults(metrics)
+	results := createPerformanceTestResults(metrics, perfConfig.Concurrency)
 	report := reporter.GenerateReport(results, time.Now())
 
 	filename := fmt.Sprintf("performance-test-report-%s.%s",
@@ -142,7 +166,7 @@ func getFileExtension(format string) string {
 	}
 }
 
-func createPerformanceTestResults(metrics *tester.PerformanceMetrics) []models.TestResult {
+func createPerformanceTestResults(metrics *tester.PerformanceMetrics, concurrency int) []models.TestResult {
 	results := []models.TestResult{
 		{
 			TestCaseID: "PERF-001",
@@ -150,8 +174,9 @@ func createPerformanceTestResults(metrics *tester.PerformanceMetrics) []models.T
 			Status:     models.Pass,
 			StartTime:  time.Now(),
 			EndTime:    time.Now(),
-			Duration:   time.Duration(metrics.AvgGenerationRate) * time.Second,
-			Message:    fmt.Sprintf("%.2f tokens/second", metrics.AvgGenerationRate),
+			// AvgGenerationRate 单位是 tokens/second，不是时长，不能放进 Duration。
+			Duration: 0,
+			Message:  fmt.Sprintf("%.2f tokens/second", metrics.AvgGenerationRate),
 		},
 		{
 			TestCaseID: "PERF-002",
@@ -272,14 +297,16 @@ func createPerformanceTestResults(metrics *tester.PerformanceMetrics) []models.T
 		},
 	}
 
-	// 为每个结果设置适当的度量值
-	for i := range results {
-		results[i].Metrics = models.Metrics{
+	// 整体 Metrics 仅挂到主结果（PERF-001）上，避免每一行都写同一份指标。
+	// ConcurrentUsers 应该是本次压测的 worker 并发数，不是 RPS。
+	if len(results) > 0 {
+		results[0].Metrics = models.Metrics{
 			ResponseTime:    metrics.AvgLatency,
 			Latency:         metrics.AvgLatency,
 			Throughput:      metrics.RPS,
+			SuccessRate:     metrics.SuccessRate,
 			TokenCount:      int(metrics.AvgOutputTokens),
-			ConcurrentUsers: int(metrics.RPS), // 临时设置
+			ConcurrentUsers: concurrency,
 		}
 	}
 

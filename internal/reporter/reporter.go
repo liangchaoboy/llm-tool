@@ -12,14 +12,17 @@ import (
 
 // GenerateReport 生成测试报告
 func GenerateReport(results []models.TestResult, generatedAt time.Time) models.TestReport {
-	// 计算摘要统计
+	// 计算摘要统计。
+	// 注意：很多 PERF-XXX 行是"数值展示行"（RPS、RPM、token 数等），它们的 Duration 是 0
+	// 而不是真实耗时。把这些行纳入 min/avg 计算会把摘要里的 MinTime 永远压成 0、
+	// AverageTime 也被稀释。所以只对 Duration>0 的行参与耗时统计。
 	var totalTests, passedTests, failedTests, skippedTests, errorTests int
 	var totalTime time.Duration
-	var minTime, maxTime time.Duration = time.Duration(^uint64(0) >> 1), 0 // 初始化为最大和最小值
+	var minTime, maxTime time.Duration
+	var durationSamples int
 
 	for _, result := range results {
 		totalTests++
-		totalTime += result.Duration
 
 		switch result.Status {
 		case models.Pass:
@@ -32,7 +35,12 @@ func GenerateReport(results []models.TestResult, generatedAt time.Time) models.T
 			errorTests++
 		}
 
-		if result.Duration < minTime {
+		if result.Duration <= 0 {
+			continue
+		}
+		totalTime += result.Duration
+		durationSamples++
+		if minTime == 0 || result.Duration < minTime {
 			minTime = result.Duration
 		}
 		if result.Duration > maxTime {
@@ -41,8 +49,8 @@ func GenerateReport(results []models.TestResult, generatedAt time.Time) models.T
 	}
 
 	var avgTime time.Duration
-	if totalTests > 0 {
-		avgTime = totalTime / time.Duration(totalTests)
+	if durationSamples > 0 {
+		avgTime = totalTime / time.Duration(durationSamples)
 	}
 
 	successRate := 0.0

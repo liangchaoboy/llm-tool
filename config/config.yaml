@@ -1,68 +1,15 @@
 api:
   base_url: "https://api.openai.com/v1/chat/completions"  # 替换为实际的API端点
-  api_key: "your-api-key-here"  # 替换为实际的API密钥（真实 key 请写到 config/config.local.yaml）
-  model: "gpt-3.5-turbo"  # 占位值；实际 model 来自 test-case-file 中每条用例的 model 字段
-  timeout: 15m
-  retry_count: 0
+  api_key: "your-api-key-here"                            # 真实 key 请写到 config/config.local.yaml
+  model: "gpt-3.5-turbo"                                  # 占位值；实际 model 来自测试用例中每条请求的 model 字段
+  timeout: 10m                                            # 单次请求超时（HTTP round-trip，含流式读取完成）
+  retry_count: 0                                          # 基准测试建议 0：重试会掩盖真实延迟与失败率
   retry_delay: 1s
   headers:
     User-Agent: "LLM-Test-Tool/1.0"
 
 test:
-  functional:
-    enabled: true
-    timeout: 60s
-    test_cases_file: ""
-    max_retries: 3
-  
   performance:
-    enabled: true
-    concurrency: 10
-    duration: 5m
-    warmup_time: 30s
-    requests: 1000
-    timeout: 30s
-    thresholds:
-      max_response_time: 5s
-      min_success_rate: 95.0
-      max_error_rate: 5.0
-      min_throughput: 10.0  # 每秒最小请求数
-  
-  stability:
-    enabled: true
-    duration: 1h
-    interval: 10s
-    max_errors: 10
-    check_health: true
-  
-  security:
-    enabled: true
-    test_sql_injection: true
-    test_xss: true
-    test_injection: true
-    blocked_inputs:
-      - "<script>"
-      - "DROP TABLE"
-      - "<?php"
-    allowed_inputs:
-      - "hello"
-      - "test"
-      - "sample"
-  
-  compatibility:
-    enabled: true
-    models:
-      - "gpt-3.5-turbo"
-      - "gpt-4"
-    formats:
-      - "text"
-      - "json"
-      - "code"
-    parameters:
-      - "temperature"
-      - "max_tokens"
-      - "top_p"
-    max_tokens:
-      - 100
-      - 200
-      - 500
+    concurrency: 10             # 并发 worker 数；CLI -concurrency 会覆盖此值
+    requests_per_worker: 100    # 每个 worker 串行发出的请求数；CLI -requests-per-worker 会覆盖此值
+    test_case_file: ""          # 测试用例 JSON 文件路径；CLI -test-case-file 会覆盖此值

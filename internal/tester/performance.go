@@ -110,11 +110,13 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 	var totalOutputTokens int64
 	var totalLatency int64
 	var ttftSum int64
+	var ttftSamples int64 // 实际测到首 token 的请求数（用于 TTFT 均值分母）
 	var tpotSum int64
-	var totalOutputTokenCount int64
-	var totalGenerationRateSum float64 // 累计每个请求的生成速率（token/秒）
-	var generationRateMutex sync.Mutex // 保护totalGenerationRateSum的并发访问
-	var caseCursor int64               // 全局游标，确保多 worker 间均匀轮询所有用例
+	var tpotSamples int64 // outputTokens>=2 的请求数（用于 TPOT 均值分母）
+	var genRateSum float64
+	var genRateSamples int64 // outputTokens>0 的请求数（用于 AvgGenerationRate 分母）
+	var genRateMutex sync.Mutex
+	var caseCursor int64 // 全局游标，确保多 worker 间均匀轮询所有用例
 
 	var wg sync.WaitGroup
 
@@ -179,18 +181,28 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 
 				// 更新统计
 				atomic.AddInt64(&totalRequests, 1)
-				atomic.AddInt64(&successfulRequests, 1) // 成功请求计数
+				atomic.AddInt64(&successfulRequests, 1)
 				atomic.AddInt64(&totalTokens, int64(inputTokens+outputTokens))
 				atomic.AddInt64(&totalOutputTokens, int64(outputTokens))
 				atomic.AddInt64(&totalLatency, requestLatency.Nanoseconds())
-				atomic.AddInt64(&ttftSum, ttft.Nanoseconds())
-				atomic.AddInt64(&tpotSum, tpot.Nanoseconds())
-				atomic.AddInt64(&totalOutputTokenCount, int64(outputTokens))
-				
-				// 累计每个请求的生成速率（使用mutex保护float64的并发访问）
-				generationRateMutex.Lock()
-				totalGenerationRateSum += requestGenerationRate
-				generationRateMutex.Unlock()
+
+				// TTFT: 只在解析器真测到首 token 时才计入均值（ttft==0 表示该请求没产生 content 帧）
+				if ttft > 0 {
+					atomic.AddInt64(&ttftSum, ttft.Nanoseconds())
+					atomic.AddInt64(&ttftSamples, 1)
+				}
+				// TPOT: 需要至少 2 个输出 token 才有意义
+				if tpot > 0 {
+					atomic.AddInt64(&tpotSum, tpot.Nanoseconds())
+					atomic.AddInt64(&tpotSamples, 1)
+				}
+				// 单请求生成速率: 只在产生了输出 token 时才计入均值
+				if requestGenerationRate > 0 {
+					genRateMutex.Lock()
+					genRateSum += requestGenerationRate
+					genRateSamples++
+					genRateMutex.Unlock()
+				}
 
 				// 显示进度
 				currentTotal := atomic.LoadInt64(&totalRequests)
@@ -214,17 +226,24 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 	if totalRequestCount > 0 {
 		metrics.TotalRequests = totalRequestCount
 		metrics.SuccessfulRequests = successfulRequestCount
+
 		if successfulRequestCount > 0 {
-			metrics.AvgLatency = time.Duration(atomic.LoadInt64(&totalLatency) / successfulRequestCount) // 只对成功请求计算平均时延
-			metrics.TTFT = time.Duration(atomic.LoadInt64(&ttftSum) / successfulRequestCount)
-			metrics.TPOT = time.Duration(atomic.LoadInt64(&tpotSum) / successfulRequestCount)
+			metrics.AvgLatency = time.Duration(atomic.LoadInt64(&totalLatency) / successfulRequestCount)
+		}
+
+		// TTFT / TPOT / AvgGenerationRate 各自用自己的有效样本数作分母，
+		// 避免 outputTokens==0 或无 content 帧的请求把均值拉低。
+		if n := atomic.LoadInt64(&ttftSamples); n > 0 {
+			metrics.TTFT = time.Duration(atomic.LoadInt64(&ttftSum) / n)
+		}
+		if n := atomic.LoadInt64(&tpotSamples); n > 0 {
+			metrics.TPOT = time.Duration(atomic.LoadInt64(&tpotSum) / n)
 		}
 
 		// 使用实际的测试运行时间计算速率指标
 		testDurationSeconds := actualTestDuration.Seconds()
 		if testDurationSeconds > 0 {
-			// 这些计算基于实际的测试运行时间
-			metrics.RPS = float64(successfulRequestCount) / testDurationSeconds // 使用成功请求数计算RPS
+			metrics.RPS = float64(successfulRequestCount) / testDurationSeconds
 			metrics.RPM = metrics.RPS * 60
 
 			totalTokens := atomic.LoadInt64(&totalTokens)
@@ -235,17 +254,16 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 			metrics.OutputTPM = metrics.OutputTPS * 60
 
 			if successfulRequestCount > 0 {
-				metrics.AvgOutputTokens = float64(totalOutputTokens) / float64(successfulRequestCount) // 基于成功请求计算
+				metrics.AvgOutputTokens = float64(totalOutputTokens) / float64(successfulRequestCount)
 			}
-			// AvgGenerationRate 是每个请求的平均生成速率（每个请求的输出token数/该请求耗时，然后对所有请求求平均）
-			generationRateMutex.Lock()
-			if successfulRequestCount > 0 {
-				metrics.AvgGenerationRate = totalGenerationRateSum / float64(successfulRequestCount)
-			}
-			generationRateMutex.Unlock()
 		}
 
-		// 计算成功率
+		genRateMutex.Lock()
+		if genRateSamples > 0 {
+			metrics.AvgGenerationRate = genRateSum / float64(genRateSamples)
+		}
+		genRateMutex.Unlock()
+
 		metrics.SuccessRate = float64(successfulRequestCount) / float64(totalRequestCount) * 100.0
 	}
 

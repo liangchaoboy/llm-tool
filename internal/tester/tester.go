@@ -77,10 +77,6 @@ func (tr *TestRunner) RunFunctionalTests(ctx context.Context) []models.TestResul
 func (tr *TestRunner) RunPerformanceTests(ctx context.Context) []models.TestResult {
 	var results []models.TestResult
 
-	if !tr.config.Performance.Enabled {
-		return results
-	}
-
 	// 并发性能测试
 	concurrentResults := tr.runConcurrentPerformanceTest(ctx)
 	results = append(results, concurrentResults...)
