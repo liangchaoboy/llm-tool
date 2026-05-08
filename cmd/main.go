@@ -109,7 +109,7 @@ func main() {
 
 	// 运行性能测试
 	startTime := time.Now()
-	metrics := perfTester.RunPerformanceTest(context.Background())
+	metrics, perRequestResults := perfTester.RunPerformanceTest(context.Background())
 	testDuration := time.Since(startTime)
 
 	// 注意：performance.go 内部已经使用实际测试时间计算所有指标
@@ -138,8 +138,24 @@ func main() {
 	fmt.Printf("Total TPS (含Prompt): %.2f  Total TPM: %.2f\n", metrics.TPS, metrics.TPM)
 
 	// 生成测试报告
-	results := createPerformanceTestResults(metrics, perfConfig.Concurrency)
-	report := reporter.GenerateReport(results, time.Now())
+	//
+	// 报告结构：
+	//   - perRequestResults：每次真实 HTTP 请求一行（PERF-REQ-XXXX），含 reqid、
+	//     起止时间、in/out tokens、TTFT、输出 TPS 等明细；
+	//   - aggregate：14 条 PERF-001..014 聚合指标展示行（沿用原展示形态）。
+	// 真实请求行放前面，表格读起来就是按时间顺序的用例明细；聚合指标行贴在
+	// 后面作为总结。
+	aggregate := createPerformanceTestResults(metrics, perfConfig.Concurrency)
+	allResults := make([]models.TestResult, 0, len(perRequestResults)+len(aggregate))
+	allResults = append(allResults, perRequestResults...)
+	allResults = append(allResults, aggregate...)
+
+	// Summary 必须从 metrics 构造，而不是基于 len(allResults) 让 reporter 自动统计——
+	// 后者会把 14 行聚合指标也计入 TotalTests，让报告里的"总测试数""成功率"与
+	// 控制台打印的真实数字对不上。
+	summary := buildPerformanceSummary(metrics, perRequestResults)
+
+	report := reporter.GenerateReportWithSummary(allResults, summary, time.Now())
 
 	filename := fmt.Sprintf("performance-test-report-%s.%s",
 		time.Now().Format("20060102-150405"),
@@ -151,6 +167,37 @@ func main() {
 	}
 
 	fmt.Printf("\n性能测试完成！报告已保存到: %s\n", filename)
+}
+
+// buildPerformanceSummary 用真实请求量构造 Summary。
+// MinTime / MaxTime 只看成功请求（失败请求的 Duration 经常是超时上限，会把最大值
+// 拉到不真实的高点）；AverageTime 沿用 metrics.AvgLatency（已按成功请求数算过均值）。
+func buildPerformanceSummary(metrics *tester.PerformanceMetrics, perRequestResults []models.TestResult) models.Summary {
+	s := models.Summary{
+		TotalTests:   int(metrics.TotalRequests),
+		PassedTests:  int(metrics.SuccessfulRequests),
+		FailedTests:  int(metrics.TotalRequests - metrics.SuccessfulRequests),
+		SkippedTests: 0,
+		ErrorTests:   0,
+		SuccessRate:  metrics.SuccessRate,
+		AverageTime:  metrics.AvgLatency,
+	}
+
+	var minD, maxD time.Duration
+	for _, r := range perRequestResults {
+		if r.Status != models.Pass || r.Duration <= 0 {
+			continue
+		}
+		if minD == 0 || r.Duration < minD {
+			minD = r.Duration
+		}
+		if r.Duration > maxD {
+			maxD = r.Duration
+		}
+	}
+	s.MinTime = minD
+	s.MaxTime = maxD
+	return s
 }
 
 func getFileExtension(format string) string {
