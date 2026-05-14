@@ -46,6 +46,13 @@ type Metrics struct {
 	RequestSize     int           `json:"request_size,omitempty"`
 	ResponseSize    int           `json:"response_size,omitempty"`
 	ConcurrentUsers int           `json:"concurrent_users,omitempty"`
+
+	// 以下字段用于单次请求级别的统计（报告里每一条 PERF-REQ-XXXX 行会填充）
+	RequestID    string        `json:"request_id,omitempty"`    // 上游响应头里的 reqid，便于事后排障
+	InputTokens  int           `json:"input_tokens,omitempty"`  // 本次请求的输入 token 数
+	OutputTokens int           `json:"output_tokens,omitempty"` // 本次请求的输出 token 数
+	OutputTPS    float64       `json:"output_tps,omitempty"`    // 本次请求的输出 token/秒
+	TTFT         time.Duration `json:"ttft,omitempty"`          // 本次请求的首 token 耗时
 }
 
 // TestSuite 测试套件

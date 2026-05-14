@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/user/llm-test-tool/internal/api"
+	"github.com/user/llm-test-tool/internal/models"
 )
 
 // PerformanceTester 性能测试器
@@ -91,8 +94,11 @@ func (pt *PerformanceTester) loadTestCases() error {
 	return nil
 }
 
-// RunPerformanceTest 运行性能测试
-func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *PerformanceMetrics {
+// RunPerformanceTest 运行性能测试。
+//
+// 除了返回聚合指标 PerformanceMetrics 外，还返回每一次真实 HTTP 请求对应的
+// TestResult 列表（按 StartTime 升序），供上层生成详尽的测试报告使用。
+func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) (*PerformanceMetrics, []models.TestResult) {
 	fmt.Printf("开始性能测试，使用并发数: %d，每并发请求数: %d\n",
 		pt.config.Concurrency, pt.config.RequestsPerWorker)
 
@@ -117,6 +123,18 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 	var genRateSamples int64 // outputTokens>0 的请求数（用于 AvgGenerationRate 分母）
 	var genRateMutex sync.Mutex
 	var caseCursor int64 // 全局游标，确保多 worker 间均匀轮询所有用例
+	var reqSeq int64     // 全局请求序号，给每一条 TestResult 生成唯一 TestCaseID
+
+	// TestCaseID 里序号的零填充宽度：按「预期总请求数」算，保证按字符串排序也能得到自然顺序。
+	totalExpected := pt.config.Concurrency * pt.config.RequestsPerWorker
+	seqWidth := len(strconv.Itoa(totalExpected))
+	if seqWidth < 4 {
+		seqWidth = 4
+	}
+	seqFormat := fmt.Sprintf("PERF-REQ-%%0%dd", seqWidth)
+
+	// worker 私有 slice：完全无锁收集 TestResult，wg.Wait() 后合并。
+	workerResults := make([][]models.TestResult, pt.config.Concurrency)
 
 	var wg sync.WaitGroup
 
@@ -125,6 +143,8 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
+
+			local := make([]models.TestResult, 0, pt.config.RequestsPerWorker)
 
 			for j := 0; j < pt.config.RequestsPerWorker; j++ {
 				// 用全局 atomic 游标轮询，避免多 worker 重复抽同一批用例
@@ -135,13 +155,33 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 
 				// TTFT 由 SSE 解析器在收到第一个含内容的 data 帧时打点返回，
 				// 这里拿到的是真正的 Time To First Token，而不是整个请求耗时。
-				resp, ttft, err := pt.client.RetryCallRawWithTTFT(ctx, reqBody, true)
+				resp, stats, err := pt.client.RetryCallRawWithStats(ctx, reqBody, true)
 
 				requestLatency := time.Since(startTime)
+				endTime := startTime.Add(requestLatency) // 保证 EndTime-StartTime 与 Duration 完全一致
+				ttft := stats.TTFT
+
+				seqN := atomic.AddInt64(&reqSeq, 1)
+				testCaseID := fmt.Sprintf(seqFormat, seqN)
 
 				if err != nil {
-					fmt.Printf("请求失败: %v\n", err)
 					atomic.AddInt64(&totalRequests, 1) // 即使失败也计入总请求数
+
+					failResult := models.TestResult{
+						TestCaseID: testCaseID,
+						Name:       fmt.Sprintf("性能测试请求 #%d", seqN),
+						Status:     models.Fail,
+						StartTime:  startTime,
+						EndTime:    endTime,
+						Duration:   requestLatency,
+						Error:      err.Error(),
+						Metrics: models.Metrics{
+							RequestID: stats.RequestID, // 可能为空；上游有回响应头就带出来
+							Latency:   requestLatency,
+						},
+					}
+					local = append(local, failResult)
+					logRequestLine(failResult)
 					continue
 				}
 
@@ -204,16 +244,42 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 					genRateMutex.Unlock()
 				}
 
-				// 显示进度
-				currentTotal := atomic.LoadInt64(&totalRequests)
-				if currentTotal%100 == 0 {
-					fmt.Printf("已完成 %d 个请求\n", currentTotal)
+				okResult := models.TestResult{
+					TestCaseID: testCaseID,
+					Name:       fmt.Sprintf("性能测试请求 #%d", seqN),
+					Status:     models.Pass,
+					StartTime:  startTime,
+					EndTime:    endTime,
+					Duration:   requestLatency,
+					Metrics: models.Metrics{
+						RequestID:    stats.RequestID,
+						Latency:      requestLatency,
+						InputTokens:  inputTokens,
+						OutputTokens: outputTokens,
+						OutputTPS:    requestGenerationRate,
+						TTFT:         ttft,
+						TokenCount:   outputTokens, // 兼容已有字段语义（单请求输出 token 数）
+					},
 				}
+				local = append(local, okResult)
+				logRequestLine(okResult)
 			}
+
+			workerResults[workerID] = local
 		}(i)
 	}
 
 	wg.Wait()
+
+	// 合并 per-worker 结果，按 StartTime 升序排，让报告表格按时间顺序读
+	var perRequestResults []models.TestResult
+	perRequestResults = make([]models.TestResult, 0, int(atomic.LoadInt64(&totalRequests)))
+	for _, w := range workerResults {
+		perRequestResults = append(perRequestResults, w...)
+	}
+	sort.Slice(perRequestResults, func(i, j int) bool {
+		return perRequestResults[i].StartTime.Before(perRequestResults[j].StartTime)
+	})
 
 	// 计算实际测试持续时间
 	actualTestDuration := time.Since(testStartTime)
@@ -267,7 +333,34 @@ func (pt *PerformanceTester) RunPerformanceTest(ctx context.Context) *Performanc
 		metrics.SuccessRate = float64(successfulRequestCount) / float64(totalRequestCount) * 100.0
 	}
 
-	return metrics
+	return metrics, perRequestResults
+}
+
+// logRequestLine prints one key=value line per request to stdout. We build the
+// full string first and write it with fmt.Fprintln so concurrent writers don't
+// interleave mid-line — multiple Printf calls can slice each other under load.
+func logRequestLine(r models.TestResult) {
+	const tsFormat = "2006-01-02T15:04:05.000Z07:00"
+	reqID := r.Metrics.RequestID
+	if reqID == "" {
+		reqID = "unset"
+	}
+	line := fmt.Sprintf(
+		"[req] id=%s status=%s start=%s end=%s in=%d out=%d out_tps=%.2f ttft=%s latency=%s",
+		reqID,
+		r.Status,
+		r.StartTime.Format(tsFormat),
+		r.EndTime.Format(tsFormat),
+		r.Metrics.InputTokens,
+		r.Metrics.OutputTokens,
+		r.Metrics.OutputTPS,
+		r.Metrics.TTFT,
+		r.Duration,
+	)
+	if r.Error != "" {
+		line += fmt.Sprintf(" err=%q", r.Error)
+	}
+	fmt.Fprintln(os.Stdout, line)
 }
 
 // selectTestCase 按索引轮询选择一个请求 body（原样透传给 API）
@@ -315,8 +408,10 @@ func (pt *PerformanceTester) extractContentString(content interface{}) string {
 	}
 }
 
-// RunPerformanceTestWithDetailedMetrics 运行性能测试并返回详细指标
-func (tr *TestRunner) RunPerformanceTestWithDetailedMetrics(ctx context.Context, perfConfig PerformanceConfig) *PerformanceMetrics {
+// RunPerformanceTestWithDetailedMetrics 运行性能测试并返回详细指标。
+// 目前暂无调用方；保留仅为对外接口的最小表面。返回值透传 RunPerformanceTest
+// 的 (metrics, per-request results) 两元组。
+func (tr *TestRunner) RunPerformanceTestWithDetailedMetrics(ctx context.Context, perfConfig PerformanceConfig) (*PerformanceMetrics, []models.TestResult) {
 	client := tr.client // 使用现有的客户端
 	perfTester := NewPerformanceTester(client, perfConfig)
 

@@ -77,6 +77,20 @@ func GenerateReport(results []models.TestResult, generatedAt time.Time) models.T
 	}
 }
 
+// GenerateReportWithSummary 使用调用方已经算好的 Summary 生成报告。
+//
+// 适用场景：报告里的 results 包含多种"性质"的行（例如性能测试里既有每请求的
+// PERF-REQ-XXXX 明细行，也有 PERF-001..014 的聚合指标展示行），直接用
+// len(results) 统计总测试数会失真。这种情况下由调用方用真实数据源（如性能
+// metrics）构造 Summary 传进来，本函数只负责组装 TestReport。
+func GenerateReportWithSummary(results []models.TestResult, summary models.Summary, generatedAt time.Time) models.TestReport {
+	return models.TestReport{
+		GeneratedAt: generatedAt,
+		Summary:     summary,
+		Results:     results,
+	}
+}
+
 // SaveReport 保存测试报告到文件
 func SaveReport(report models.TestReport, filename, format string) error {
 	switch format {

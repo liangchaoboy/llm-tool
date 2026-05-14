@@ -9,7 +9,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/user/llm-test-tool/config"
@@ -305,20 +307,106 @@ func parseChatCompletionSSE(resp *http.Response, sendStart time.Time) (*Response
 	return &out, ttft, nil
 }
 
+// CallStats carries per-call observability metadata that does not fit into
+// Response itself. It is populated on both success and error paths so callers
+// can correlate a failed request with upstream logs via RequestID.
+type CallStats struct {
+	RequestID string        // 上游响应头里的 reqid（X-Request-Id / X-Reqid / X-Trace-Id），拿不到则为空
+	TTFT      time.Duration // 首 token 耗时；非流式响应里等于读到响应 body 的耗时；失败时为 0
+}
+
+// reqIDHeaders lists response headers that upstream services use to propagate
+// a request identifier, in priority order. Go's http.Header canonicalizes
+// keys via textproto.CanonicalMIMEHeaderKey, so casing like "X-Request-ID"
+// and "x-request-id" collapse to the same canonical entry — no need to list
+// every case variant here.
+//
+// Covers:
+//   - Generic / nginx-style:           X-Request-Id, X-Reqid, X-Trace-Id
+//   - OpenAI:                          X-Request-Id (already covered)
+//   - Anthropic:                       Request-Id
+//   - Azure OpenAI / APIM:             Apim-Request-Id, X-Ms-Request-Id
+//   - AWS Bedrock:                     X-Amzn-Requestid, X-Amzn-Trace-Id
+//   - Google Cloud:                    X-Cloud-Trace-Context
+var reqIDHeaders = []string{
+	"X-Request-Id",
+	"X-Reqid",
+	"X-Trace-Id",
+	"Request-Id",
+	"Apim-Request-Id",
+	"X-Ms-Request-Id",
+	"X-Amzn-Requestid",
+	"X-Amzn-Trace-Id",
+	"X-Cloud-Trace-Context",
+}
+
+// extractRequestID returns the first non-empty value from the known set of
+// request-id headers, or "" if none is present. As a fallback when no known
+// header matches, it scans the full header map for any key whose canonical
+// form contains "reqid" or "request-id" (case-insensitive in spirit, but
+// Go has already canonicalized the keys so we match against the canonical
+// lowercase form).
+func extractRequestID(h http.Header) string {
+	for _, name := range reqIDHeaders {
+		if v := h.Get(name); v != "" {
+			return v
+		}
+	}
+	// Fallback: tolerate upstreams using a header name we haven't enumerated.
+	for k, v := range h {
+		if len(v) == 0 || v[0] == "" {
+			continue
+		}
+		lk := strings.ToLower(k)
+		if strings.Contains(lk, "reqid") || strings.Contains(lk, "request-id") {
+			return v[0]
+		}
+	}
+	return ""
+}
+
+// debugHeadersOnce prints the full response header map once per process when
+// LLM_TOOL_DEBUG_HEADERS=1 is set — useful for identifying the real request-id
+// header name when the default list fails to match.
+var debugHeadersOnce sync.Once
+
+func maybeDumpHeadersForDebug(h http.Header) {
+	if os.Getenv("LLM_TOOL_DEBUG_HEADERS") != "1" {
+		return
+	}
+	debugHeadersOnce.Do(func() {
+		fmt.Fprintln(os.Stderr, "[debug] response headers of first request:")
+		for k, v := range h {
+			fmt.Fprintf(os.Stderr, "  %s: %s\n", k, strings.Join(v, ", "))
+		}
+	})
+}
+
 // CallRaw sends the given JSON body as-is. Used when test cases already contain
 // the full request payload (model/messages/stream/etc).
 func (c *Client) CallRaw(ctx context.Context, body []byte, streamHint bool) (*Response, error) {
-	resp, _, err := c.CallRawWithTTFT(ctx, body, streamHint)
+	resp, _, err := c.CallRawWithStats(ctx, body, streamHint)
 	return resp, err
 }
 
 // CallRawWithTTFT sends the given JSON body as-is and returns the measured TTFT.
-// For SSE responses, TTFT is the time from request send until the first content frame.
-// For non-streaming responses, TTFT coincides with reading the response body.
+// Thin wrapper over CallRawWithStats retained for backward compatibility.
 func (c *Client) CallRawWithTTFT(ctx context.Context, body []byte, streamHint bool) (*Response, time.Duration, error) {
+	resp, stats, err := c.CallRawWithStats(ctx, body, streamHint)
+	return resp, stats.TTFT, err
+}
+
+// CallRawWithStats sends the given JSON body as-is and returns both the parsed
+// response and per-call stats (request id, TTFT). The request id is captured
+// from response headers as soon as they arrive, so callers can still correlate
+// a failed request with upstream logs even when the body parse later errors.
+//
+// For SSE responses, TTFT is the time from request send until the first content
+// frame. For non-streaming responses, TTFT coincides with reading the body.
+func (c *Client) CallRawWithStats(ctx context.Context, body []byte, streamHint bool) (*Response, CallStats, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.config.BaseURL, bytes.NewBuffer(body))
 	if err != nil {
-		return nil, 0, fmt.Errorf("创建HTTP请求失败: %w", err)
+		return nil, CallStats{}, fmt.Errorf("创建HTTP请求失败: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -330,56 +418,76 @@ func (c *Client) CallRawWithTTFT(ctx context.Context, body []byte, streamHint bo
 	sendStart := time.Now()
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, 0, fmt.Errorf("发送请求失败: %w", err)
+		// 连接未建立，没有响应头可读
+		return nil, CallStats{}, fmt.Errorf("发送请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// 响应头在状态行之后立刻到达，body 还没开始读也能取。捕获一次，后续无论走哪条
+	// 解析路径、出不出错都带上它——失败请求日志没有 reqid 就无法定位到上游。
+	maybeDumpHeadersForDebug(resp.Header)
+	stats := CallStats{RequestID: extractRequestID(resp.Header)}
+
 	if streamHint || strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-		return parseChatCompletionSSE(resp, sendStart)
+		apiResp, ttft, parseErr := parseChatCompletionSSE(resp, sendStart)
+		stats.TTFT = ttft
+		return apiResp, stats, parseErr
 	}
 
 	respBody, err := io.ReadAll(resp.Body)
-	ttft := time.Since(sendStart)
+	stats.TTFT = time.Since(sendStart)
 	if err != nil {
-		return nil, 0, fmt.Errorf("读取响应体失败: %w", err)
+		return nil, stats, fmt.Errorf("读取响应体失败: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, 0, fmt.Errorf("API返回错误状态码 %d: %s", resp.StatusCode, string(respBody))
+		return nil, stats, fmt.Errorf("API返回错误状态码 %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var apiResp Response
 	if err := json.Unmarshal(respBody, &apiResp); err != nil {
-		return nil, 0, fmt.Errorf("解析响应失败: %w", err)
+		return nil, stats, fmt.Errorf("解析响应失败: %w", err)
 	}
-	return &apiResp, ttft, nil
+	return &apiResp, stats, nil
 }
 
 // RetryCallRaw retries CallRaw with the client's retry policy.
 func (c *Client) RetryCallRaw(ctx context.Context, body []byte, streamHint bool) (*Response, error) {
-	resp, _, err := c.RetryCallRawWithTTFT(ctx, body, streamHint)
+	resp, _, err := c.RetryCallRawWithStats(ctx, body, streamHint)
 	return resp, err
 }
 
-// RetryCallRawWithTTFT retries CallRawWithTTFT. The returned TTFT reflects only
-// the winning attempt — for benchmark accuracy prefer RetryCount=0 so retries
-// don't mask real slowness.
+// RetryCallRawWithTTFT retries CallRawWithTTFT. Thin wrapper over
+// RetryCallRawWithStats retained for backward compatibility.
 func (c *Client) RetryCallRawWithTTFT(ctx context.Context, body []byte, streamHint bool) (*Response, time.Duration, error) {
+	resp, stats, err := c.RetryCallRawWithStats(ctx, body, streamHint)
+	return resp, stats.TTFT, err
+}
+
+// RetryCallRawWithStats retries CallRawWithStats with the client's retry policy.
+// On success, the returned stats reflect the winning attempt. On final failure,
+// the stats reflect the LAST attempt — so a failed-request log still gets a
+// usable request id when the upstream managed to emit one.
+//
+// For benchmark accuracy prefer RetryCount=0 so retries don't mask real slowness.
+func (c *Client) RetryCallRawWithStats(ctx context.Context, body []byte, streamHint bool) (*Response, CallStats, error) {
 	var lastErr error
+	var lastStats CallStats
 	for i := 0; i <= c.config.RetryCount; i++ {
-		resp, ttft, err := c.CallRawWithTTFT(ctx, body, streamHint)
+		resp, stats, err := c.CallRawWithStats(ctx, body, streamHint)
 		if err == nil {
-			return resp, ttft, nil
+			return resp, stats, nil
 		}
 		lastErr = err
+		lastStats = stats
 		if i < c.config.RetryCount {
 			select {
 			case <-ctx.Done():
-				return nil, 0, ctx.Err()
+				return nil, lastStats, ctx.Err()
 			case <-time.After(c.config.RetryDelay):
 			}
 		}
 	}
-	return nil, 0, fmt.Errorf("重试%d次后仍然失败: %w", c.config.RetryCount, lastErr)
+	return nil, lastStats, fmt.Errorf("重试%d次后仍然失败: %w", c.config.RetryCount, lastErr)
 }
 
 // HealthCheck 健康检查
